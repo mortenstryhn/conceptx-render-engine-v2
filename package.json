@@ -1,0 +1,15 @@
+{
+  "name": "conceptx-render-engine",
+  "version": "1.0.0",
+  "description": "Playwright rendering engine for Concept X Device Preview — renders any URL at a chosen device size, waits for ads to load, and returns a screenshot.",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "1.49.0",
+    "ws": "^8.18.0"
+  }
+}

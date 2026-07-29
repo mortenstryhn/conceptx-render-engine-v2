@@ -1,0 +1,18 @@
+# Render.com Blueprint — deploy this repo as a Docker web service.
+# In Render: New + → Blueprint → point at the repo containing this file.
+services:
+  - type: web
+    name: conceptx-render-engine-v2
+    runtime: docker
+    region: frankfurt          # EU region → European ad targeting. Use "frankfurt" for DK/Nordic.
+    plan: starter              # ~$7/mo, 512MB. Bump to "standard" if you render large desktop pages.
+    healthCheckPath: /health
+    envVars:
+      - key: RENDER_TOKEN      # set a secret; the frontend must send ?token=<this>
+        generateValue: true
+      - key: LOCALE
+        value: da-DK
+      - key: TIMEZONE
+        value: Europe/Copenhagen
+      - key: MAX_CONCURRENCY
+        value: "2"
