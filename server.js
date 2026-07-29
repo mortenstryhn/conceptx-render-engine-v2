@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.3-adnami";                                        // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.4-adnami-preview";                                // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -234,6 +234,9 @@ function normalizeCreative(raw) {
 }
 
 // Fetch (server-side) the ins-tag markup Adnami publishes for a creative.
+// The endpoint returns a text block with many DSP-specific variants of the SAME
+// <ins> tag (ActiveAgent, Adform, DV360, Xandr, …). We only need the slot size
+// and the format type from it — we build our own single, clean preview tag.
 async function fetchAdnamiInsTags(creativeCode) {
   const url = ADNAMI_INSTAGS_URL(creativeCode);
   const opts = { headers: { accept: "text/html,application/xhtml+xml,*/*" } };
@@ -242,55 +245,67 @@ async function fetchAdnamiInsTags(creativeCode) {
   try { res = await fetch(url, opts); }
   catch (e) { throw new Error("Kunne ikke nå Adnami (ins-tags): " + (e.message || e)); }
   if (!res.ok) throw new Error(`Adnami svarede ${res.status} for creative ${creativeCode} (findes det ID?)`);
-  const html = ((await res.text()) || "").trim();
-  if (!html || !/<ins[\s>]/i.test(html)) throw new Error("Adnami returnerede ingen ins-tag for dette creative-ID");
-  return html;
+  const text = ((await res.text()) || "").trim();
+  if (!text) throw new Error("Adnami returnerede et tomt svar for dette creative-ID");
+  return text;
 }
 
-// Insert the ins-tag(s) into the page and load the render engine, then wait
-// for the creative to mount. `placement` is an optional CSS selector; when it
-// matches an element the creative is appended there, otherwise it is placed at
-// the top of <body> (correct for top-anchored high-impact formats).
-async function injectAdnami(page, creativeCode, placement) {
-  const served = await fetchAdnamiInsTags(creativeCode);
-  const result = await page.evaluate(({ served, fallbackEngine, placement }) => {
-    const tmp = document.createElement("div");
-    tmp.innerHTML = served;
-    const inses = Array.from(tmp.querySelectorAll("ins"));
-    if (!inses.length) return { ok: false, reason: "no-ins" };
-    const scriptSrcs = Array.from(tmp.querySelectorAll("script[src]"))
-      .map((s) => s.getAttribute("src")).filter(Boolean);
+// Pull slot width/height and the format type out of the served tag text.
+function parseAdnamiSpec(text) {
+  const w = /width:\s*(\d+)px/i.exec(text);
+  const h = /height:\s*(\d+)px/i.exec(text);
+  const t = /data-adnm-type=['"]?([\w-]+)/i.exec(text);
+  return {
+    width:  w ? parseInt(w[1], 10) : 300,
+    height: h ? parseInt(h[1], 10) : 240,
+    type:   t ? t[1] : "",
+  };
+}
 
-    // Where to place the creative.
+// Build ONE clean *preview* ins-tag and load the Adnami render engine, then wait
+// for the creative to mount. Two things make this work on an arbitrary page:
+//   1. a single well-formed <ins> (not the ~20 DSP variants the endpoint lists), and
+//   2. data-adnm-preview — Adnami's live tags only render on certified publisher
+//      domains, but the preview flag lets the format render anywhere.
+// This mirrors what the "Adnami Tool" browser extension does, server-side.
+// `placement` is an optional CSS selector; when it matches an element the creative
+// is appended there, otherwise it is placed at the top of <body>.
+async function injectAdnami(page, creativeCode, placement) {
+  let spec = { width: 300, height: 240, type: "" };
+  let fetchNote = "";
+  try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); }
+  catch (e) { fetchNote = String(e.message || e); } // non-fatal: still try a preview tag by creative id
+
+  const result = await page.evaluate(({ creativeCode, spec, engineSrc, placement }) => {
+    const ins = document.createElement("ins");
+    ins.className = "adnm-tag";
+    ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px;`;
+    ins.setAttribute("data-adnm-cc", creativeCode);
+    if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+    ins.setAttribute("data-adnm-preview", ""); // preview mode → renders off certified domains
+
     let host = null, prepend = false;
     if (placement) { try { host = document.querySelector(placement); } catch (e) { host = null; } }
     if (!host) { host = document.body; prepend = true; }
+    if (!host) return { ok: false, reason: "no-host" };
+    if (prepend && host.firstChild) host.insertBefore(ins, host.firstChild);
+    else host.appendChild(ins);
 
-    for (const ins of inses) {
-      if (prepend && host.firstChild) host.insertBefore(ins, host.firstChild);
-      else host.appendChild(ins);
-    }
+    const s = document.createElement("script");
+    s.async = true; s.type = "text/javascript"; s.src = engineSrc;
+    (document.head || document.documentElement).appendChild(s);
+    return { ok: true, type: spec.type, w: spec.width, h: spec.height };
+  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "" });
 
-    // Load whatever script(s) the tag references; make sure the gen engine is present.
-    const srcs = scriptSrcs.slice();
-    if (!srcs.some((s) => s && s.includes("adnm.ads.v2.js"))) srcs.push(fallbackEngine);
-    for (const src of srcs) {
-      const s = document.createElement("script");
-      s.async = true; s.type = "text/javascript"; s.src = src;
-      (document.head || document.documentElement).appendChild(s);
-    }
-    return { ok: true, count: inses.length };
-  }, { served, fallbackEngine: ADNAMI_ENGINE_SRC, placement: placement || "" });
-
-  if (!result || !result.ok) throw new Error("Kunne ikke indsætte Adnami-creative på siden");
+  if (!result || !result.ok) throw new Error("Kunne ikke indsætte Adnami-creative på siden" + (fetchNote ? (" (" + fetchNote + ")") : ""));
 
   // Adnami mounts the creative inside an <iframe id="adsm-iframe-…">.
-  await page.waitForFunction(
-    () => !!document.querySelector('iframe[id^="adsm-iframe"], iframe[id*="adnm"], [data-adnm-rendered]'),
-    { timeout: 9000 }
-  ).catch(() => {});
-  await page.waitForTimeout(1800); // let expansion / animation settle
-  return result;
+  const mounted = await page.waitForFunction(
+    () => !!document.querySelector('iframe[id^="adsm-iframe"], iframe[id*="adnm"], ins.adnm-tag iframe, [data-adnm-rendered]'),
+    { timeout: 12000 }
+  ).then(() => true).catch(() => false);
+  await page.waitForTimeout(2000); // let expansion / animation settle
+  return { ...result, mounted, fetchNote };
 }
 
 /* ------------------------------------------------------------------ *
@@ -334,8 +349,13 @@ async function renderShot({ url, device, landscape, fullPage, format, manualCons
     await page.waitForTimeout(1200);
     // Inject the chosen Adnami creative before scrolling so lazy formats mount.
     if (creative) {
-      try { await injectAdnami(page, creative, placement); }
-      catch (e) { adnamiError = String(e.message || e); }
+      try {
+        const r = await injectAdnami(page, creative, placement);
+        if (r && r.mounted === false) {
+          adnamiError = "creative mountede ikke (ukendt ID, forkert format-type, eller Adnami afviste preview)"
+            + (r.fetchNote ? " · " + r.fetchNote : "");
+        }
+      } catch (e) { adnamiError = String(e.message || e); }
     }
     await autoScroll(page);
     await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
@@ -385,6 +405,21 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_req, res) => res.json({ ok: true, version: ENGINE_VERSION, devices: Object.keys(DEVICES) }));
+
+// Debug: what does the engine actually get from Adnami for a creative, and what
+// spec does it parse? Handy for diagnosing "the format won't show" without a browser.
+app.get("/adnami-tag", async (req, res) => {
+  if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) return res.status(401).json({ error: "Ugyldig token" });
+  let creative;
+  try { creative = normalizeCreative(req.query.creative); } catch (e) { return res.status(400).json({ error: e.message }); }
+  if (!creative) return res.status(400).json({ error: "Mangler ?creative" });
+  try {
+    const text = await fetchAdnamiInsTags(creative);
+    res.json({ ok: true, creative, url: ADNAMI_INSTAGS_URL(creative), spec: parseAdnamiSpec(text), rawLength: text.length, rawSample: text.slice(0, 1400) });
+  } catch (e) {
+    res.status(502).json({ ok: false, creative, url: ADNAMI_INSTAGS_URL(creative), error: String(e.message || e) });
+  }
+});
 
 app.get("/render", async (req, res) => {
   if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) {
@@ -478,7 +513,12 @@ function setupLive(httpServer) {
     const doInject = async () => {
       if (!liveCreative || !page) return;
       send({ t: "notice", msg: "Indsætter Adnami-format…" });
-      try { await injectAdnami(page, liveCreative, livePlacement); send({ t: "notice", msg: "Adnami-format indsat ✓" }); }
+      try {
+        const r = await injectAdnami(page, liveCreative, livePlacement);
+        send({ t: "notice", msg: (r && r.mounted)
+          ? "Adnami-format indsat ✓"
+          : "Adnami-tag indsat, men formatet mountede ikke (tjek ID/format-type)." });
+      }
       catch (e) { send({ t: "notice", msg: "Adnami: " + String(e.message || e) }); }
     };
     const bumpIdle = () => {
