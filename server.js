@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.11-adnami-clean-replace";                         // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.11.1-inspect-alias";                              // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -543,7 +543,7 @@ app.get("/adnami-tag", async (req, res) => {
 // window.adsm present with certifications, did the creative iframe mount, and any
 // console errors (e.g. CSP violations or a blockedReason). Read this via the URL
 // to see exactly why a format won't show, without needing a browser to watch it.
-app.get("/adnami-render-debug", async (req, res) => {
+app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req, res) => {
   if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) return res.status(401).json({ error: "Ugyldig token" });
   const rawUrl = String(req.query.url || "").trim();
   if (!rawUrl) return res.status(400).json({ error: "Mangler ?url" });
