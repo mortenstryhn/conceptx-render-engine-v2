@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.5.1-adnami-debug";                                // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.6-adnami-macro";                                  // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -291,10 +291,24 @@ async function injectAdnami(page, creativeCode, placement) {
     if (prepend && host.firstChild) host.insertBefore(ins, host.firstChild);
     else host.appendChild(ins);
 
+    // 1) Load the domain "macro" (adsm.macro.<domain>.js) which sets up window.adsm
+    //    and the render context. WITHOUT this, adnm.ads.v2.js aborts with
+    //    "context_initialization_failed" / "missing_creative_code". This mirrors
+    //    the extension's adnm.macro.loader.js (note the adnm-lite attribute).
+    const h = window.location.host;
+    const multiTld = /\.(co\.uk|gov\.uk|com\.uk|org\.uk|com\.vn|net\.vn|com\.ar|co\.jp|com\.au|org\.au|com\.cn|edu\.cn|gov\.cn|ac\.jp|co\.kr|or\.kr|go\.kr|com\.mx|org\.mx|co\.nz|org\.nz|gov\.nz|net\.nz|co\.il|com\.es|com\.br|com\.hk|com\.gr|com\.uy|info\.pl|com\.do|com\.tr|com\.ec)$/.test(h);
+    const domain = multiTld ? h.split(".").slice(-3).join(".") : h.split(".").slice(-2).join(".");
+    const macro = document.createElement("script");
+    macro.async = true; macro.type = "text/javascript";
+    macro.src = "https://functions.adnami.io/api/macro/adsm.macro." + domain + ".js";
+    macro.setAttribute("adnm-lite", "");
+    (document.head || document.documentElement).appendChild(macro);
+
+    // 2) Load the render engine (it polls for window.adsm, so order is not critical).
     const s = document.createElement("script");
     s.async = true; s.type = "text/javascript"; s.src = engineSrc;
     (document.head || document.documentElement).appendChild(s);
-    return { ok: true, type: spec.type, w: spec.width, h: spec.height };
+    return { ok: true, type: spec.type, w: spec.width, h: spec.height, macroDomain: domain };
   }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "" });
 
   if (!result || !result.ok) throw new Error("Kunne ikke indsætte Adnami-creative på siden" + (fetchNote ? (" (" + fetchNote + ")") : ""));
@@ -469,10 +483,18 @@ app.get("/adnami-render-debug", async (req, res) => {
       if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
       ins.setAttribute("data-adnm-preview", "");
       document.body.insertBefore(ins, document.body.firstChild);
+      const h = window.location.host;
+      const multiTld = /\.(co\.uk|gov\.uk|com\.uk|org\.uk|com\.vn|net\.vn|com\.ar|co\.jp|com\.au|org\.au|com\.cn|edu\.cn|gov\.cn|ac\.jp|co\.kr|or\.kr|go\.kr|com\.mx|org\.mx|co\.nz|org\.nz|gov\.nz|net\.nz|co\.il|com\.es|com\.br|com\.hk|com\.gr|com\.uy|info\.pl|com\.do|com\.tr|com\.ec)$/.test(h);
+      const domain = multiTld ? h.split(".").slice(-3).join(".") : h.split(".").slice(-2).join(".");
+      const macro = document.createElement("script");
+      macro.async = true; macro.type = "text/javascript";
+      macro.src = "https://functions.adnami.io/api/macro/adsm.macro." + domain + ".js";
+      macro.setAttribute("adnm-lite", "");
+      (document.head || document.documentElement).appendChild(macro);
       const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
       (document.head || document.documentElement).appendChild(s);
     }, { creativeCode: creative, spec, engineSrc: ADNAMI_ENGINE_SRC }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
-    await page.waitForTimeout(4500); // enough for the macro to load + log/decide
+    await page.waitForTimeout(6000); // enough for the macro + engine to load + render
     out.dom = await page.evaluate(() => {
       const ins = document.querySelector("ins.adnm-tag");
       let adsm = null;
