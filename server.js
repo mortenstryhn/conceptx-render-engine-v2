@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.9-adnami-pick";                                   // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.10-adnami-replace";                               // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -350,17 +350,19 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
     // Remove ONLY our own injected tags (never the publisher's real slots).
     document.querySelectorAll("ins[data-cx-injected]").forEach((n) => n.remove());
 
-    // Find the element under the click, then climb to a block-level container so
-    // the ad lands between content blocks, not inside a word.
-    let target = document.elementFromPoint(x, y);
-    if (!target || target === document.documentElement) target = document.body;
-    let guard = 0;
-    while (target && target !== document.body && guard++ < 40) {
-      const disp = getComputedStyle(target).display;
-      if (disp && disp.indexOf("inline") !== 0 && target.getBoundingClientRect().width > 40) break;
-      target = target.parentElement;
+    // Find what was clicked, then climb to the ad "slot": the wrapper that sits
+    // tightly around the clicked ad, but NOT the whole content column. We stop
+    // climbing once the parent becomes much taller than the current node.
+    let node = document.elementFromPoint(x, y);
+    if (!node || node === document.documentElement) node = document.body;
+    let slot = node, guard = 0;
+    while (slot.parentElement && slot.parentElement !== document.body &&
+           slot.parentElement !== document.documentElement && guard++ < 8) {
+      const ps = slot.parentElement.getBoundingClientRect();
+      const ss = slot.getBoundingClientRect();
+      if (ps.height > ss.height * 1.6 + 60) break; // parent is a big container → stop here
+      slot = slot.parentElement;
     }
-    if (!target) target = document.body;
 
     const ins = document.createElement("ins");
     ins.className = "adnm-tag";
@@ -371,14 +373,20 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
     ins.setAttribute("data-adnm-preview", "");
     ins.setAttribute("data-cx-injected", "");
 
-    // Insert into the content flow at the chosen spot.
-    if (target === document.body) target.insertBefore(ins, target.firstChild);
-    else target.parentNode.insertBefore(ins, target);
+    // REPLACE the existing ad in that slot with our creative.
+    let mode;
+    if (slot === document.body || !slot.parentNode) {
+      slot.insertBefore(ins, slot.firstChild); mode = "prepend-body";
+    } else if (slot.tagName === "IFRAME" || slot.tagName === "IMG" || slot.tagName === "VIDEO") {
+      slot.replaceWith(ins); mode = "replace-node"; // swap the ad element itself
+    } else {
+      slot.replaceChildren(ins); mode = "replace-content"; // clear the slot, put ours inside
+    }
 
     const s = document.createElement("script");
     s.async = true; s.type = "text/javascript"; s.src = engineSrc;
     ins.appendChild(s);
-    return { ok: true, tag: target.tagName };
+    return { ok: true, tag: slot.tagName, mode };
   }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, x: Math.round(x), y: Math.round(y) });
 
   const mounted = await page.waitForFunction(
