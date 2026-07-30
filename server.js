@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.8-adnami-inner";                                  // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.9-adnami-pick";                                   // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -310,6 +310,7 @@ async function injectAdnami(page, creativeCode, placement) {
     if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
     ins.setAttribute("data-adnm-session", String(Date.now())); // cachebuster, like real tags
     ins.setAttribute("data-adnm-preview", ""); // force THIS creative regardless of live booking
+    ins.setAttribute("data-cx-injected", ""); // our marker, so pick-placement can replace it
 
     let host = null, prepend = false;
     if (placement) { try { host = document.querySelector(placement); } catch (e) { host = null; } }
@@ -336,6 +337,56 @@ async function injectAdnami(page, creativeCode, placement) {
   ).then(() => true).catch(() => false);
   await page.waitForTimeout(2000); // let expansion / animation settle
   return { ...result, mounted, ctxReady, fetchNote };
+}
+
+// Re-place the creative at a clicked point (device CSS px). Removes our previously
+// injected tag and drops a fresh one in the content flow at that spot. Assumes the
+// macro/context is already loaded (injectAdnami ran once for this session).
+async function placeAdnamiAt(page, creativeCode, x, y) {
+  let spec = { width: 300, height: 240, type: "" };
+  try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
+
+  const result = await page.evaluate(({ creativeCode, spec, engineSrc, x, y }) => {
+    // Remove ONLY our own injected tags (never the publisher's real slots).
+    document.querySelectorAll("ins[data-cx-injected]").forEach((n) => n.remove());
+
+    // Find the element under the click, then climb to a block-level container so
+    // the ad lands between content blocks, not inside a word.
+    let target = document.elementFromPoint(x, y);
+    if (!target || target === document.documentElement) target = document.body;
+    let guard = 0;
+    while (target && target !== document.body && guard++ < 40) {
+      const disp = getComputedStyle(target).display;
+      if (disp && disp.indexOf("inline") !== 0 && target.getBoundingClientRect().width > 40) break;
+      target = target.parentElement;
+    }
+    if (!target) target = document.body;
+
+    const ins = document.createElement("ins");
+    ins.className = "adnm-tag";
+    ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px;`;
+    ins.setAttribute("data-adnm-cc", creativeCode);
+    if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+    ins.setAttribute("data-adnm-session", String(Date.now()));
+    ins.setAttribute("data-adnm-preview", "");
+    ins.setAttribute("data-cx-injected", "");
+
+    // Insert into the content flow at the chosen spot.
+    if (target === document.body) target.insertBefore(ins, target.firstChild);
+    else target.parentNode.insertBefore(ins, target);
+
+    const s = document.createElement("script");
+    s.async = true; s.type = "text/javascript"; s.src = engineSrc;
+    ins.appendChild(s);
+    return { ok: true, tag: target.tagName };
+  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, x: Math.round(x), y: Math.round(y) });
+
+  const mounted = await page.waitForFunction(
+    () => !!document.querySelector('iframe[id^="adsm-iframe"], ins.adnm-tag iframe, [data-adnm-rendered]'),
+    { timeout: 10000 }
+  ).then(() => true).catch(() => false);
+  await page.waitForTimeout(1500);
+  return { ...result, mounted };
 }
 
 /* ------------------------------------------------------------------ *
@@ -756,6 +807,14 @@ function setupLive(httpServer) {
                 try { const su = await assertSafeUrl(msg.url); await page.goto(su, { waitUntil: "domcontentloaded" }); if (!manualConsent) await dismissConsent(page); await doInject(); }
                 catch (e) { send({ t: "error", msg: e.message }); }
               }
+            }
+            else if (msg.t === "pick") {
+              if (!liveCreative) { send({ t: "notice", msg: "Indsæt et creative-ID og tryk Vis format først." }); return; }
+              send({ t: "notice", msg: "Placerer annoncen her…" });
+              try {
+                const r = await placeAdnamiAt(page, liveCreative, +msg.x, +msg.y);
+                send({ t: "notice", msg: (r && r.mounted) ? "Annonce placeret her ✓" : "Placeret, men formatet mountede ikke — prøv et andet sted på siden." });
+              } catch (e) { send({ t: "notice", msg: "Placering fejlede: " + String(e.message || e) }); }
             }
           }).catch(() => {});
         }
