@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.4-adnami-preview";                                // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.5-adnami-debug";                                  // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -418,6 +418,72 @@ app.get("/adnami-tag", async (req, res) => {
     res.json({ ok: true, creative, url: ADNAMI_INSTAGS_URL(creative), spec: parseAdnamiSpec(text), rawLength: text.length, rawSample: text.slice(0, 1400) });
   } catch (e) {
     res.status(502).json({ ok: false, creative, url: ADNAMI_INSTAGS_URL(creative), error: String(e.message || e) });
+  }
+});
+
+// Deep debug: actually loads the page, injects the creative, and reports what
+// Adnami's script does at runtime — did the render engine + host macro load, is
+// window.adsm present with certifications, did the creative iframe mount, and any
+// console errors (e.g. CSP violations or a blockedReason). Read this via the URL
+// to see exactly why a format won't show, without needing a browser to watch it.
+app.get("/adnami-render-debug", async (req, res) => {
+  if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) return res.status(401).json({ error: "Ugyldig token" });
+  const rawUrl = String(req.query.url || "").trim();
+  if (!rawUrl) return res.status(400).json({ error: "Mangler ?url" });
+  let creative;
+  try { creative = normalizeCreative(req.query.creative); } catch (e) { return res.status(400).json({ error: e.message }); }
+  if (!creative) return res.status(400).json({ error: "Mangler ?creative" });
+  const device = String(req.query.device || DEFAULT_DEVICE);
+  const manualConsent = req.query.consent === "manual";
+  let safeUrl;
+  try { safeUrl = await assertSafeUrl(rawUrl); } catch (e) { return res.status(400).json({ error: e.message }); }
+
+  const dev = DEVICES[device] || DEVICES[DEFAULT_DEVICE];
+  const browser = await getBrowser();
+  const context = await browser.newContext({
+    viewport: { width: dev.w, height: dev.h }, deviceScaleFactor: 1,
+    isMobile: dev.mobile, hasTouch: dev.mobile, userAgent: dev.ua,
+    locale: LOCALE, timezoneId: TIMEZONE, ignoreHTTPSErrors: true,
+  });
+  const page = await context.newPage();
+  const consoleMsgs = [], adnamiReqs = [];
+  page.on("console", (m) => { if (consoleMsgs.length < 120) consoleMsgs.push(m.type() + ": " + m.text()); });
+  page.on("pageerror", (e) => { if (consoleMsgs.length < 120) consoleMsgs.push("pageerror: " + String(e.message || e)); });
+  page.on("requestfailed", (r) => { const u = r.url(); if (/adnami|adsm/i.test(u) && adnamiReqs.length < 80) adnamiReqs.push({ url: u.slice(0, 160), failed: (r.failure() && r.failure().errorText) || "failed" }); });
+  page.on("response", (r) => { const u = r.url(); if (/adnami|adsm/i.test(u) && adnamiReqs.length < 80) adnamiReqs.push({ url: u.slice(0, 160), status: r.status() }); });
+
+  const out = { creative, url: safeUrl, device, version: ENGINE_VERSION };
+  try {
+    await page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+    if (!manualConsent) await dismissConsent(page);
+    await page.waitForTimeout(1200);
+    try { out.inject = await injectAdnami(page, creative, ""); } catch (e) { out.injectError = String(e.message || e); }
+    await page.waitForTimeout(5000); // give the macro time to load + decide
+    out.dom = await page.evaluate(() => {
+      const ins = document.querySelector("ins.adnm-tag");
+      let adsm = null;
+      try { adsm = (window.top && window.top.adsm) || window.adsm || null; } catch (e) { adsm = window.adsm || null; }
+      return {
+        insHTML: ins ? ins.outerHTML.slice(0, 500) : null,
+        insChildCount: ins ? ins.children.length : 0,
+        adsmPresent: !!adsm,
+        adsmHasCertifications: !!(adsm && adsm.certifications),
+        adsmCertKeys: adsm && adsm.certifications ? Object.keys(adsm.certifications).slice(0, 25) : [],
+        adsmIframe: !!document.querySelector('iframe[id^="adsm-iframe"]'),
+        anyAdnmIframe: !!document.querySelector('iframe[id*="adnm"], iframe[id*="adsm"]'),
+        adnamiScripts: Array.from(document.querySelectorAll('script[src*="adnami"]')).map((s) => s.src.slice(0, 160)),
+      };
+    });
+    out.consoleMsgs = consoleMsgs;
+    out.adnamiReqs = adnamiReqs;
+    return res.json(out);
+  } catch (e) {
+    out.error = String(e.message || e);
+    out.consoleMsgs = consoleMsgs;
+    out.adnamiReqs = adnamiReqs;
+    return res.status(502).json(out);
+  } finally {
+    await context.close().catch(() => {});
   }
 });
 
