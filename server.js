@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.11.1-inspect-alias";                              // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.13-skin-auto";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -282,6 +282,54 @@ async function loadAdnamiContext(page) {
   }, { timeout: 9000 }).then(() => true).catch(() => false);
 }
 
+// Reveal a SKIN / wallpaper format: a skin renders as a full-page background on
+// document.body, hidden on most sites by the page's own opaque backgrounds. We
+// gather the site's real content into a centered column (leaving Adnami's own
+// elements full-width behind) and make the page backgrounds transparent, so the
+// skin shows through in the left/right margins. Best-effort — layout varies by site.
+async function revealSkin(page, maxWidth) {
+  await page.evaluate(({ maxW }) => {
+    if (document.getElementById("cx-skin-wrap")) return;
+    const isAdnami = (ch) => {
+      try {
+        if (ch.matches && ch.matches("ins[data-cx-injected], ins.adnm-tag")) return true;
+        if (/adnm|adsm/i.test(ch.id || "")) return true;
+        if (typeof ch.className === "string" && /adnm|adsm/i.test(ch.className)) return true;
+        if (ch.querySelector && ch.querySelector('iframe[id^="adsm-iframe"], [data-adnm-bridge-groups], ins.adnm-tag')) return true;
+      } catch (e) {}
+      return false;
+    };
+    const wrap = document.createElement("div");
+    wrap.id = "cx-skin-wrap";
+    wrap.style.cssText = "position:relative;z-index:1;max-width:" + maxW + "px;margin:0 auto;background:#ffffff;min-height:100vh;box-shadow:0 0 40px rgba(0,0,0,.18);";
+    // Move the site's own top-level content into the centered column.
+    for (const ch of Array.from(document.body.children)) {
+      if (ch === wrap) continue;
+      if (ch.tagName === "SCRIPT" || ch.tagName === "STYLE" || ch.tagName === "LINK") continue;
+      if (isAdnami(ch)) continue; // leave Adnami's wallpaper/banner full-width behind
+      wrap.appendChild(ch);
+    }
+    document.body.insertBefore(wrap, document.body.firstChild);
+    const st = document.createElement("style");
+    st.id = "cx-skin-style";
+    st.textContent = "html,body{background:transparent !important;}";
+    (document.head || document.documentElement).appendChild(st);
+  }, { maxW: Math.max(600, parseInt(maxWidth, 10) || 1010) }).catch(() => {});
+  await page.waitForTimeout(700);
+}
+
+// After a creative renders, Adnami tags the rendered element with data-adnm-fid =
+// the format name (e.g. "adnami-canvas-seamless-skin"). If it's a skin/wallpaper,
+// auto-run revealSkin so the tool handles it without any manual toggle.
+async function maybeRevealSkin(page) {
+  const fid = await page.evaluate(() => {
+    const el = document.querySelector("[data-adnm-fid]");
+    return el ? (el.getAttribute("data-adnm-fid") || "") : "";
+  }).catch(() => "");
+  if (/skin/i.test(fid)) { await revealSkin(page); return fid; }
+  return "";
+}
+
 // Build ONE clean *preview* ins-tag and load the Adnami render engine, then wait
 // for the creative to mount. Two things make this work on an arbitrary page:
 //   1. a single well-formed <ins> (not the ~20 DSP variants the endpoint lists), and
@@ -336,7 +384,8 @@ async function injectAdnami(page, creativeCode, placement) {
     { timeout: 12000 }
   ).then(() => true).catch(() => false);
   await page.waitForTimeout(2000); // let expansion / animation settle
-  return { ...result, mounted, ctxReady, fetchNote };
+  const skinFid = await maybeRevealSkin(page); // auto-detects skin/wallpaper formats and reveals them
+  return { ...result, mounted, ctxReady, fetchNote, skinFid };
 }
 
 // Re-place the creative at a clicked point (device CSS px). To guarantee the ad
@@ -418,6 +467,7 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
     { timeout: 10000 }
   ).then(() => true).catch(() => false);
   await page.waitForTimeout(1200);
+  await maybeRevealSkin(page); // in case the picked creative is a skin/wallpaper
   await page.evaluate(() => {
     const i = document.querySelector("ins[data-cx-injected]");
     if (i && i.scrollIntoView) i.scrollIntoView({ block: "center" });
@@ -607,6 +657,7 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
       ins.appendChild(s);
     }, { creativeCode: creative, spec, engineSrc: ADNAMI_ENGINE_SRC }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
     await page.waitForTimeout(5500); // let the engine render into the ready context
+    out.skinFid = await maybeRevealSkin(page); // auto-detects + reveals skins
     out.dom = await page.evaluate(() => {
       const ins = document.querySelector("ins.adnm-tag");
       let adsm = null;
@@ -620,6 +671,10 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
         adsmIframe: !!document.querySelector('iframe[id^="adsm-iframe"]'),
         anyAdnmIframe: !!document.querySelector('iframe[id*="adnm"], iframe[id*="adsm"]'),
         adnamiScripts: Array.from(document.querySelectorAll('script[src*="adnami"]')).map((s) => s.src.slice(0, 160)),
+        bodyChildren: Array.from(document.body.children).slice(0, 30).map((c) => {
+          const r = c.getBoundingClientRect(); const cs = getComputedStyle(c);
+          return { tag: c.tagName, id: (c.id || "").slice(0, 30), cls: (typeof c.className === "string" ? c.className : "").slice(0, 45), pos: cs.position, z: cs.zIndex, bg: cs.backgroundColor, w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.left) };
+        }),
       };
     });
     out.consoleMsgs = consoleMsgs;
