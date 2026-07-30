@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.10-adnami-replace";                               // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.11-adnami-clean-replace";                         // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -262,6 +262,26 @@ function parseAdnamiSpec(text) {
   };
 }
 
+// Load the domain "macro" (adsm.macro.<domain>.js) and wait for window.adsm to
+// initialise. Shared by the initial injection and by pick-placement (after reload).
+async function loadAdnamiContext(page) {
+  await page.evaluate(() => {
+    if (document.querySelector("script[data-adnm-macro]")) return;
+    const h = window.location.host;
+    const multiTld = /\.(co\.uk|gov\.uk|com\.uk|org\.uk|com\.vn|net\.vn|com\.ar|co\.jp|com\.au|org\.au|com\.cn|edu\.cn|gov\.cn|ac\.jp|co\.kr|or\.kr|go\.kr|com\.mx|org\.mx|co\.nz|org\.nz|gov\.nz|net\.nz|co\.il|com\.es|com\.br|com\.hk|com\.gr|com\.uy|info\.pl|com\.do|com\.tr|com\.ec)$/.test(h);
+    const domain = multiTld ? h.split(".").slice(-3).join(".") : h.split(".").slice(-2).join(".");
+    const macro = document.createElement("script");
+    macro.async = true; macro.type = "text/javascript";
+    macro.src = "https://functions.adnami.io/api/macro/adsm.macro." + domain + ".js";
+    macro.setAttribute("adnm-lite", ""); macro.setAttribute("data-adnm-macro", "");
+    (document.head || document.documentElement).appendChild(macro);
+  }).catch(() => {});
+  return await page.waitForFunction(() => {
+    try { const a = (window.top && window.top.adsm) || window.adsm; return !!(a && a.certifications); }
+    catch (e) { return !!(window.adsm && window.adsm.certifications); }
+  }, { timeout: 9000 }).then(() => true).catch(() => false);
+}
+
 // Build ONE clean *preview* ins-tag and load the Adnami render engine, then wait
 // for the creative to mount. Two things make this work on an arbitrary page:
 //   1. a single well-formed <ins> (not the ~20 DSP variants the endpoint lists), and
@@ -276,28 +296,8 @@ async function injectAdnami(page, creativeCode, placement) {
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); }
   catch (e) { fetchNote = String(e.message || e); } // non-fatal: still try a preview tag by creative id
 
-  // PHASE 1 — load the domain "macro" (adsm.macro.<domain>.js). It sets up
-  // window.adsm + the certifications the render engine needs. Loading the engine
-  // before this is ready causes "context_initialization_failed". Mirrors the
-  // extension's adnm.macro.loader.js (note the adnm-lite attribute).
-  await page.evaluate(() => {
-    if (document.querySelector("script[data-adnm-macro]")) return;
-    const h = window.location.host;
-    const multiTld = /\.(co\.uk|gov\.uk|com\.uk|org\.uk|com\.vn|net\.vn|com\.ar|co\.jp|com\.au|org\.au|com\.cn|edu\.cn|gov\.cn|ac\.jp|co\.kr|or\.kr|go\.kr|com\.mx|org\.mx|co\.nz|org\.nz|gov\.nz|net\.nz|co\.il|com\.es|com\.br|com\.hk|com\.gr|com\.uy|info\.pl|com\.do|com\.tr|com\.ec)$/.test(h);
-    const domain = multiTld ? h.split(".").slice(-3).join(".") : h.split(".").slice(-2).join(".");
-    const macro = document.createElement("script");
-    macro.async = true; macro.type = "text/javascript";
-    macro.src = "https://functions.adnami.io/api/macro/adsm.macro." + domain + ".js";
-    macro.setAttribute("adnm-lite", "");
-    macro.setAttribute("data-adnm-macro", "");
-    (document.head || document.documentElement).appendChild(macro);
-  });
-
-  // Wait for the context (window.adsm.certifications) to initialise.
-  const ctxReady = await page.waitForFunction(() => {
-    try { const a = (window.top && window.top.adsm) || window.adsm; return !!(a && a.certifications); }
-    catch (e) { return !!(window.adsm && window.adsm.certifications); }
-  }, { timeout: 9000 }).then(() => true).catch(() => false);
+  // PHASE 1 — load the domain macro + wait for the render context to initialise.
+  const ctxReady = await loadAdnamiContext(page);
   await page.waitForTimeout(300);
 
   // PHASE 2 — now insert the ins-tag and load the render engine, so the engine
@@ -339,20 +339,27 @@ async function injectAdnami(page, creativeCode, placement) {
   return { ...result, mounted, ctxReady, fetchNote };
 }
 
-// Re-place the creative at a clicked point (device CSS px). Removes our previously
-// injected tag and drops a fresh one in the content flow at that spot. Assumes the
-// macro/context is already loaded (injectAdnami ran once for this session).
+// Re-place the creative at a clicked point (device CSS px). To guarantee the ad
+// never shows in two places, we capture a selector for the clicked slot, RELOAD the
+// page (wiping the previous render completely), then inject ONCE — replacing that slot.
 async function placeAdnamiAt(page, creativeCode, x, y) {
-  let spec = { width: 300, height: 240, type: "" };
-  try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
-
-  const result = await page.evaluate(({ creativeCode, spec, engineSrc, x, y }) => {
-    // Remove ONLY our own injected tags (never the publisher's real slots).
-    document.querySelectorAll("ins[data-cx-injected]").forEach((n) => n.remove());
-
-    // Find what was clicked, then climb to the ad "slot": the wrapper that sits
-    // tightly around the clicked ad, but NOT the whole content column. We stop
-    // climbing once the parent becomes much taller than the current node.
+  // 1) Capture a stable selector for the clicked slot before touching anything.
+  const selector = await page.evaluate(({ x, y }) => {
+    function cssPath(el) {
+      const parts = [];
+      while (el && el.nodeType === 1 && el !== document.body && el !== document.documentElement && parts.length < 7) {
+        if (el.id) { parts.unshift("#" + CSS.escape(el.id)); return parts.join(" > "); }
+        let sel = el.tagName.toLowerCase();
+        const parent = el.parentElement;
+        if (parent) {
+          const sibs = Array.from(parent.children).filter((c) => c.tagName === el.tagName);
+          if (sibs.length > 1) sel += ":nth-of-type(" + (sibs.indexOf(el) + 1) + ")";
+        }
+        parts.unshift(sel);
+        el = el.parentElement;
+      }
+      return parts.join(" > ");
+    }
     let node = document.elementFromPoint(x, y);
     if (!node || node === document.documentElement) node = document.body;
     let slot = node, guard = 0;
@@ -360,9 +367,27 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
            slot.parentElement !== document.documentElement && guard++ < 8) {
       const ps = slot.parentElement.getBoundingClientRect();
       const ss = slot.getBoundingClientRect();
-      if (ps.height > ss.height * 1.6 + 60) break; // parent is a big container → stop here
+      if (ps.height > ss.height * 1.6 + 60) break; // parent is a big container → stop
       slot = slot.parentElement;
     }
+    return slot === document.body ? "" : cssPath(slot);
+  }, { x: Math.round(x), y: Math.round(y) });
+
+  // 2) Clean slate: reload so the previous render leaves nothing behind.
+  await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => {});
+  await dismissConsent(page).catch(() => {});
+  await page.waitForTimeout(800);
+
+  // 3) Reload context + fetch spec.
+  const ctxReady = await loadAdnamiContext(page);
+  await page.waitForTimeout(300);
+  let spec = { width: 300, height: 240, type: "" };
+  try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
+
+  // 4) Inject ONCE, replacing the captured slot (or body-top if it's gone).
+  const result = await page.evaluate(({ creativeCode, spec, engineSrc, selector }) => {
+    let slot = null;
+    if (selector) { try { slot = document.querySelector(selector); } catch (e) { slot = null; } }
 
     const ins = document.createElement("ins");
     ins.className = "adnm-tag";
@@ -373,28 +398,31 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
     ins.setAttribute("data-adnm-preview", "");
     ins.setAttribute("data-cx-injected", "");
 
-    // REPLACE the existing ad in that slot with our creative.
     let mode;
-    if (slot === document.body || !slot.parentNode) {
-      slot.insertBefore(ins, slot.firstChild); mode = "prepend-body";
+    if (!slot || slot === document.body || !slot.parentNode) {
+      document.body.insertBefore(ins, document.body.firstChild); mode = "body-top";
     } else if (slot.tagName === "IFRAME" || slot.tagName === "IMG" || slot.tagName === "VIDEO") {
       slot.replaceWith(ins); mode = "replace-node"; // swap the ad element itself
     } else {
       slot.replaceChildren(ins); mode = "replace-content"; // clear the slot, put ours inside
     }
-
     const s = document.createElement("script");
     s.async = true; s.type = "text/javascript"; s.src = engineSrc;
     ins.appendChild(s);
-    return { ok: true, tag: slot.tagName, mode };
-  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, x: Math.round(x), y: Math.round(y) });
+    return { ok: true, mode, matchedSlot: !!slot };
+  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, selector });
 
+  // 5) Wait for mount, then scroll it into view so the user sees it in place.
   const mounted = await page.waitForFunction(
     () => !!document.querySelector('iframe[id^="adsm-iframe"], ins.adnm-tag iframe, [data-adnm-rendered]'),
     { timeout: 10000 }
   ).then(() => true).catch(() => false);
-  await page.waitForTimeout(1500);
-  return { ...result, mounted };
+  await page.waitForTimeout(1200);
+  await page.evaluate(() => {
+    const i = document.querySelector("ins[data-cx-injected]");
+    if (i && i.scrollIntoView) i.scrollIntoView({ block: "center" });
+  }).catch(() => {});
+  return { ...result, mounted, ctxReady, selector };
 }
 
 /* ------------------------------------------------------------------ *
