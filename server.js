@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.5-adnami-debug";                                  // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.5.1-adnami-debug";                                // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -454,11 +454,25 @@ app.get("/adnami-render-debug", async (req, res) => {
 
   const out = { creative, url: safeUrl, device, version: ENGINE_VERSION };
   try {
-    await page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-    if (!manualConsent) await dismissConsent(page);
-    await page.waitForTimeout(1200);
-    try { out.inject = await injectAdnami(page, creative, ""); } catch (e) { out.injectError = String(e.message || e); }
-    await page.waitForTimeout(5000); // give the macro time to load + decide
+    try { await page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 22000 }); }
+    catch (e) { out.gotoNote = String(e.message || e); } // continue even if slow — we still inject + observe
+    if (!manualConsent) await dismissConsent(page).catch(() => {});
+    // Fast inline injection (no long mount-wait) so this endpoint returns quickly.
+    let spec = { width: 300, height: 240, type: "" };
+    try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creative)); } catch (e) { out.injectError = String(e.message || e); }
+    out.spec = spec;
+    await page.evaluate(({ creativeCode, spec, engineSrc }) => {
+      const ins = document.createElement("ins");
+      ins.className = "adnm-tag";
+      ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px;`;
+      ins.setAttribute("data-adnm-cc", creativeCode);
+      if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+      ins.setAttribute("data-adnm-preview", "");
+      document.body.insertBefore(ins, document.body.firstChild);
+      const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
+      (document.head || document.documentElement).appendChild(s);
+    }, { creativeCode: creative, spec, engineSrc: ADNAMI_ENGINE_SRC }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
+    await page.waitForTimeout(4500); // enough for the macro to load + log/decide
     out.dom = await page.evaluate(() => {
       const ins = document.querySelector("ins.adnm-tag");
       let adsm = null;
