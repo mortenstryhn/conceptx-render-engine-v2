@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.7-adnami-order";                                  // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.8-adnami-inner";                                  // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -308,6 +308,7 @@ async function injectAdnami(page, creativeCode, placement) {
     ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px;`;
     ins.setAttribute("data-adnm-cc", creativeCode);
     if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+    ins.setAttribute("data-adnm-session", String(Date.now())); // cachebuster, like real tags
     ins.setAttribute("data-adnm-preview", ""); // force THIS creative regardless of live booking
 
     let host = null, prepend = false;
@@ -317,12 +318,12 @@ async function injectAdnami(page, creativeCode, placement) {
     if (prepend && host.firstChild) host.insertBefore(ins, host.firstChild);
     else host.appendChild(ins);
 
-    if (!document.querySelector("script[data-adnm-engine]")) {
-      const s = document.createElement("script");
-      s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-      s.setAttribute("data-adnm-engine", "");
-      (document.head || document.documentElement).appendChild(s);
-    }
+    // The engine <script> goes INSIDE the <ins>, exactly like the real Adnami tag —
+    // the engine uses its parent <ins> to know which creative to render. Placing it
+    // in <head> left it parentless → "missing_creative_code".
+    const s = document.createElement("script");
+    s.async = true; s.type = "text/javascript"; s.src = engineSrc;
+    ins.appendChild(s);
     return { ok: true, type: spec.type, w: spec.width, h: spec.height };
   }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "" });
 
@@ -505,17 +506,18 @@ app.get("/adnami-render-debug", async (req, res) => {
       try { const a = (window.top && window.top.adsm) || window.adsm; return !!(a && a.certifications); }
       catch (e) { return !!(window.adsm && window.adsm.certifications); }
     }, { timeout: 8000 }).then(() => true).catch(() => false);
-    // Phase 2: insert the ins-tag + load the render engine.
+    // Phase 2: insert the ins-tag with the engine <script> INSIDE it (real tag shape).
     await page.evaluate(({ creativeCode, spec, engineSrc }) => {
       const ins = document.createElement("ins");
       ins.className = "adnm-tag";
       ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px;`;
       ins.setAttribute("data-adnm-cc", creativeCode);
       if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+      ins.setAttribute("data-adnm-session", String(Date.now()));
       ins.setAttribute("data-adnm-preview", "");
       document.body.insertBefore(ins, document.body.firstChild);
       const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-      (document.head || document.documentElement).appendChild(s);
+      ins.appendChild(s);
     }, { creativeCode: creative, spec, engineSrc: ADNAMI_ENGINE_SRC }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
     await page.waitForTimeout(5500); // let the engine render into the ready context
     out.dom = await page.evaluate(() => {
