@@ -14,6 +14,11 @@
 //   CACHE_TTL_MS    screenshot cache lifetime (default 300000 = 5 min)
 //   NAV_TIMEOUT_MS  navigation timeout (default 45000)
 //   ALLOW_ORIGIN    CORS Access-Control-Allow-Origin (default *)
+//   PROXY_URL       route ALL browser traffic through this proxy so the page sees a
+//                   real (e.g. Danish residential) IP instead of the datacenter IP.
+//                   Formats: http://host:port  ·  http://user:pass@host:port  ·  socks5://host:port
+//   PROXY_USERNAME  proxy auth username (optional; overrides any user in PROXY_URL)
+//   PROXY_PASSWORD  proxy auth password (optional; overrides any pass in PROXY_URL)
 
 import express from "express";
 import dns from "node:dns/promises";
@@ -40,7 +45,33 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.19-consent-in-render";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.20-proxy";                                    // bump when deploying; visible at /health
+
+/* ------------------------------------------------------------------ *
+ * Outbound proxy (optional) — route the browser through a residential *
+ * proxy so ad auctions see a real Danish user IP, not a datacenter IP.*
+ * Playwright wants credentials split out of the server URL, so if the *
+ * PROXY_URL embeds user:pass we lift them into username/password.     *
+ * ------------------------------------------------------------------ */
+function parseProxy() {
+  let raw = (process.env.PROXY_URL || "").trim();
+  if (!raw) return null;
+  // Add a default scheme for bare "host:port" (note: URL() would mis-read "host:port"
+  // as scheme "host:" + path "port", so we must detect a real "scheme://" ourselves).
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) raw = "http://" + raw;
+  let u;
+  try { u = new URL(raw); } catch { return null; }
+  const server = `${u.protocol}//${u.host}`; // u.host already includes the port
+  const username = (process.env.PROXY_USERNAME || (u.username ? decodeURIComponent(u.username) : "")).trim();
+  const password = (process.env.PROXY_PASSWORD || (u.password ? decodeURIComponent(u.password) : "")).trim();
+  const proxy = { server };
+  if (username) proxy.username = username;
+  if (password) proxy.password = password;
+  return proxy;
+}
+const PROXY = parseProxy();
+const proxyInfo = () => PROXY ? { enabled: true, server: PROXY.server, auth: !!PROXY.username } : { enabled: false };
+if (PROXY) console.log(`Proxy aktiv → ${PROXY.server}${PROXY.username ? " (med login)" : ""}`);
 
 const app = express();
 app.disable("x-powered-by");
@@ -53,6 +84,7 @@ async function getBrowser() {
   if (!browserPromise) {
     browserPromise = chromium.launch({
       executablePath: process.env.CHROMIUM_PATH || undefined, // optional override (local dev); unset in production
+      ...(PROXY ? { proxy: PROXY } : {}), // route every context/page through the proxy when configured
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -722,7 +754,27 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: ENGINE_VERSION, devices: Object.keys(DEVICES) }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: ENGINE_VERSION, proxy: proxyInfo(), devices: Object.keys(DEVICES) }));
+
+// Confirm the OUTBOUND IP the browser actually uses. Open this (with ?token=…) after
+// setting PROXY_URL to verify you now have a Danish IP: it loads an IP-echo service
+// THROUGH the browser (so it reflects the proxy) and returns country/city/org.
+app.get("/myip", async (req, res) => {
+  if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) return res.status(401).json({ error: "Ugyldig token" });
+  const context = await (await getBrowser()).newContext({ locale: LOCALE, timezoneId: TIMEZONE, ignoreHTTPSErrors: true });
+  const page = await context.newPage();
+  try {
+    await page.goto("https://ipinfo.io/json", { waitUntil: "domcontentloaded", timeout: 20000 });
+    const txt = await page.evaluate(() => document.body.innerText || "");
+    let data; try { data = JSON.parse(txt); } catch { data = { raw: txt.slice(0, 500) }; }
+    const danish = String(data.country || "").toUpperCase() === "DK";
+    return res.json({ proxy: proxyInfo(), danishIp: danish, ip: data });
+  } catch (e) {
+    return res.status(502).json({ proxy: proxyInfo(), error: String(e.message || e) });
+  } finally {
+    await context.close().catch(() => {});
+  }
+});
 
 // Debug: what does the engine actually get from Adnami for a creative, and what
 // spec does it parse? Handy for diagnosing "the format won't show" without a browser.
