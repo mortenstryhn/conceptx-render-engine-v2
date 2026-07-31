@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.18.3-fastslots";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.18.4-consent-wait";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -165,18 +165,35 @@ const CONSENT_SELECTORS = [
 // Give proper GDPR/TCF consent so the page's ad auction actually serves ads.
 // valdemarsro uses Cookiebot (IAB TCF) — accept via its JS API AND the banner button.
 async function giveConsent(page) {
+  // 1) Wait for the CMP to actually initialise (it isn't ready at domcontentloaded).
+  await page.waitForFunction(
+    () => !!(window.Cookiebot || document.querySelector('#CybotCookiebotDialog, #onetrust-banner-sdk, [id*="didomi"], [id*="sp_message_container"]')),
+    { timeout: 10000 }
+  ).catch(() => {});
+  await page.waitForTimeout(400);
+  // 2) Accept ALL via Cookiebot's API (most reliable for the TCF string).
   await page.evaluate(() => {
     try {
       if (window.Cookiebot) {
         if (typeof window.Cookiebot.submitCustomConsent === "function") window.Cookiebot.submitCustomConsent(true, true, true);
-        else if (window.Cookiebot.dialog && typeof window.Cookiebot.dialog.submitConsent === "function") window.Cookiebot.dialog.submitConsent();
+        else if (typeof window.Cookiebot.submit === "function") { try { window.Cookiebot.consent.preferences = true; window.Cookiebot.consent.statistics = true; window.Cookiebot.consent.marketing = true; } catch (e) {} window.Cookiebot.submit(window.Cookiebot.consent); }
       }
-      if (window.CookiebotDialog && window.CookiebotDialog.submitConsentButton) window.CookiebotDialog.submitConsentButton.click();
     } catch (e) {}
   }).catch(() => {});
+  // 3) Also click the accept-all button (covers Cookiebot versions where the API differs).
   await dismissConsent(page).catch(() => {});
-  // small settle so the CMP writes the TCF string before the ad auction runs
-  await page.waitForTimeout(1200);
+  // 4) WAIT for the TCF consent to actually be written (user-action-complete event).
+  await page.evaluate(() => new Promise((resolve) => {
+    try {
+      if (typeof window.__tcfapi !== "function") return resolve();
+      let done = false;
+      window.__tcfapi("addEventListener", 2, (d, ok) => {
+        if (ok && d && d.tcString && (d.eventStatus === "useractioncomplete" || d.eventStatus === "tcloaded")) { done = true; resolve(); }
+      });
+      setTimeout(() => { if (!done) resolve(); }, 7000);
+    } catch (e) { resolve(); }
+  })).catch(() => {});
+  await page.waitForTimeout(800);
 }
 
 // Report whether a valid TCF consent string is now present (for diagnostics).
