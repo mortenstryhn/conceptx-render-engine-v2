@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.18.2-consent";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.18.3-fastslots";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -738,12 +738,12 @@ app.get("/adnm-slots", async (req, res) => {
   const page = await context.newPage();
   const out = { version: ENGINE_VERSION, url: safeUrl };
   try {
-    try { await page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 25000 }); } catch (e) { out.gotoNote = String(e.message || e); }
+    try { await page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 18000 }); } catch (e) { out.gotoNote = String(e.message || e); }
     await giveConsent(page);
     out.consent = await consentState(page);
-    // Slower scroll that dwells, so lazy-loaded ad slots have time to fill.
-    await page.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 500); y += 500; if (y > 11000) { clearInterval(t); r(); } }, 350); setTimeout(() => { clearInterval(t); r(); }, 11000); })).catch(() => {});
-    await page.waitForTimeout(2500);
+    // Brief scroll to trigger above/mid-fold ad slots (kept short so this returns fast).
+    await page.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 900); y += 900; if (y > 6000) { clearInterval(t); r(); } }, 180); setTimeout(() => { clearInterval(t); r(); }, 3500); })).catch(() => {});
+    await page.waitForTimeout(1000);
     Object.assign(out, await page.evaluate(() => ({
       slotCount: document.querySelectorAll('iframe[id^="adsm-iframe"]').length,
       slotIds: Array.from(document.querySelectorAll('iframe[id^="adsm-iframe"]')).slice(0, 12).map((s) => s.id),
