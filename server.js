@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.14-iframe-preview";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.15-skin-css";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -255,11 +255,31 @@ function parseAdnamiSpec(text) {
   const w = /width:\s*(\d+)px/i.exec(text);
   const h = /height:\s*(\d+)px/i.exec(text);
   const t = /data-adnm-type=['"]?([\w-]+)/i.exec(text);
+  const fn = /tag for ['"]([^'"]+)['"]/i.exec(text); // e.g. "… Seamless Skin …"
+  const formatName = fn ? fn[1] : "";
   return {
     width:  w ? parseInt(w[1], 10) : 300,
     height: h ? parseInt(h[1], 10) : 240,
     type:   t ? t[1] : "",
+    formatName,
+    isSkin: /skin|wallpaper/i.test(formatName),
   };
+}
+
+// Non-destructive skin reveal: a skin paints a full-page background but the page's
+// own opaque background hides it in the margins. We make html/body transparent with
+// CSS only (NO node moving — that would trip the format's self-destruct watchdog),
+// so the wallpaper shows in the left/right margins around the centered content.
+async function revealSkinCss(page) {
+  await page.evaluate(() => {
+    if (document.getElementById("cx-skin-css")) return;
+    const st = document.createElement("style");
+    st.id = "cx-skin-css";
+    st.textContent =
+      "html,body{background-color:transparent !important;background-image:none !important;}";
+    (document.head || document.documentElement).appendChild(st);
+  }).catch(() => {});
+  await page.waitForTimeout(400);
 }
 
 // Load the domain "macro" (adsm.macro.<domain>.js) and wait for window.adsm to
@@ -343,10 +363,11 @@ async function injectAdnami(page, creativeCode, placement) {
 
   // Let the creative load inside its iframe and (for high-impact) break out to the page.
   await page.waitForTimeout(5000);
+  if (spec.isSkin) await revealSkinCss(page); // make the page background transparent so the skin shows in the margins
   const mounted = await page.evaluate(
     () => !!document.querySelector('iframe[id^="adsm-iframe"], iframe[id*="adnm"], [data-adnm-fid]')
   ).catch(() => false);
-  return { ...result, mounted, ctxReady, fetchNote };
+  return { ...result, mounted, ctxReady, fetchNote, isSkin: spec.isSkin };
 }
 
 // Re-place the creative at a clicked point (device CSS px). To guarantee the ad
@@ -415,6 +436,7 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
 
   // 5) Let it load, then scroll it into view so the user sees it in place.
   await page.waitForTimeout(5000);
+  if (spec.isSkin) await revealSkinCss(page);
   const mounted = await page.evaluate(
     () => !!document.querySelector('iframe[id^="adsm-iframe"], [data-adnm-fid]')
   ).catch(() => false);
@@ -592,6 +614,7 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
       frame.src = src;
     }, { src, w: spec.width, h: spec.height }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
     await page.waitForTimeout(5500); // let the engine render inside the iframe + break out
+    if (spec.isSkin) { await revealSkinCss(page); out.skinRevealed = true; }
     out.dom = await page.evaluate(() => {
       let adsm = null;
       try { adsm = (window.top && window.top.adsm) || window.adsm || null; } catch (e) { adsm = window.adsm || null; }
