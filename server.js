@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.18-real-slot";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.18.1-slots-check";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -678,6 +678,45 @@ app.get("/adnami-tag", async (req, res) => {
     res.json({ ok: true, creative, url: ADNAMI_INSTAGS_URL(creative), spec: parseAdnamiSpec(text), rawLength: text.length, rawSample: text.slice(0, 1400) });
   } catch (e) {
     res.status(502).json({ ok: false, creative, url: ADNAMI_INSTAGS_URL(creative), error: String(e.message || e) });
+  }
+});
+
+// FAST check: does the page load its OWN Adnami ad slots in this (headless) engine?
+// Returns quickly so it can be read remotely. Key question: are there real
+// "adsm-iframe" slots (the extension's green boxes) after a brief scroll?
+app.get("/adnm-slots", async (req, res) => {
+  if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) return res.status(401).json({ error: "Ugyldig token" });
+  const rawUrl = String(req.query.url || "").trim();
+  if (!rawUrl) return res.status(400).json({ error: "Mangler ?url" });
+  const device = String(req.query.device || DEFAULT_DEVICE);
+  let safeUrl;
+  try { safeUrl = await assertSafeUrl(rawUrl); } catch (e) { return res.status(400).json({ error: e.message }); }
+  const dev = DEVICES[device] || DEVICES[DEFAULT_DEVICE];
+  const context = await (await getBrowser()).newContext({
+    viewport: { width: dev.w, height: dev.h }, deviceScaleFactor: 1,
+    isMobile: dev.mobile, hasTouch: dev.mobile, userAgent: dev.ua,
+    locale: LOCALE, timezoneId: TIMEZONE, ignoreHTTPSErrors: true,
+  });
+  const page = await context.newPage();
+  const out = { version: ENGINE_VERSION, url: safeUrl };
+  try {
+    try { await page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 25000 }); } catch (e) { out.gotoNote = String(e.message || e); }
+    await dismissConsent(page).catch(() => {});
+    await page.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 900); y += 900; if (y > 9000) { clearInterval(t); r(); } }, 120); setTimeout(() => { clearInterval(t); r(); }, 6500); })).catch(() => {});
+    await page.waitForTimeout(1500);
+    Object.assign(out, await page.evaluate(() => ({
+      slotCount: document.querySelectorAll('iframe[id^="adsm-iframe"]').length,
+      slotIds: Array.from(document.querySelectorAll('iframe[id^="adsm-iframe"]')).slice(0, 12).map((s) => s.id),
+      insAdnmTags: document.querySelectorAll("ins.adnm-tag").length,
+      adnamiScripts: Array.from(document.querySelectorAll('script[src*="adnami"]')).map((s) => s.src.slice(0, 130)).slice(0, 20),
+      webdriver: navigator.webdriver === true,
+    })));
+    return res.json(out);
+  } catch (e) {
+    out.error = String(e.message || e);
+    return res.status(502).json(out);
+  } finally {
+    await context.close().catch(() => {});
   }
 });
 
