@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.13-skin-auto";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.14-iframe-preview";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -287,47 +287,20 @@ async function loadAdnamiContext(page) {
 // gather the site's real content into a centered column (leaving Adnami's own
 // elements full-width behind) and make the page backgrounds transparent, so the
 // skin shows through in the left/right margins. Best-effort — layout varies by site.
-async function revealSkin(page, maxWidth) {
-  await page.evaluate(({ maxW }) => {
-    if (document.getElementById("cx-skin-wrap")) return;
-    const isAdnami = (ch) => {
-      try {
-        if (ch.matches && ch.matches("ins[data-cx-injected], ins.adnm-tag")) return true;
-        if (/adnm|adsm/i.test(ch.id || "")) return true;
-        if (typeof ch.className === "string" && /adnm|adsm/i.test(ch.className)) return true;
-        if (ch.querySelector && ch.querySelector('iframe[id^="adsm-iframe"], [data-adnm-bridge-groups], ins.adnm-tag')) return true;
-      } catch (e) {}
-      return false;
-    };
-    const wrap = document.createElement("div");
-    wrap.id = "cx-skin-wrap";
-    wrap.style.cssText = "position:relative;z-index:1;max-width:" + maxW + "px;margin:0 auto;background:#ffffff;min-height:100vh;box-shadow:0 0 40px rgba(0,0,0,.18);";
-    // Move the site's own top-level content into the centered column.
-    for (const ch of Array.from(document.body.children)) {
-      if (ch === wrap) continue;
-      if (ch.tagName === "SCRIPT" || ch.tagName === "STYLE" || ch.tagName === "LINK") continue;
-      if (isAdnami(ch)) continue; // leave Adnami's wallpaper/banner full-width behind
-      wrap.appendChild(ch);
-    }
-    document.body.insertBefore(wrap, document.body.firstChild);
-    const st = document.createElement("style");
-    st.id = "cx-skin-style";
-    st.textContent = "html,body{background:transparent !important;}";
-    (document.head || document.documentElement).appendChild(st);
-  }, { maxW: Math.max(600, parseInt(maxWidth, 10) || 1010) }).catch(() => {});
-  await page.waitForTimeout(700);
-}
-
-// After a creative renders, Adnami tags the rendered element with data-adnm-fid =
-// the format name (e.g. "adnami-canvas-seamless-skin"). If it's a skin/wallpaper,
-// auto-run revealSkin so the tool handles it without any manual toggle.
-async function maybeRevealSkin(page) {
-  const fid = await page.evaluate(() => {
-    const el = document.querySelector("[data-adnm-fid]");
-    return el ? (el.getAttribute("data-adnm-fid") || "") : "";
-  }).catch(() => "");
-  if (/skin/i.test(fid)) { await revealSkin(page); return fid; }
-  return "";
+// Build the src for the PREVIEW iframe — a data: document containing the Adnami
+// preview ins-tag, exactly like the "Adnami Tool" extension's inject(): note
+// data-adnm-custom-adnm_preview="link" (the extension's preview flag) and that the
+// engine <script> lives INSIDE the <ins>. Rendering the creative inside its own
+// iframe (an isolated "ad slot") is what lets high-impact formats — including skins —
+// attach to the page without tearing themselves down.
+function adnamiPreviewSrc(creativeCode, type, w, h, ts) {
+  const ins =
+    `<ins style="display:inline-block;width:${w}px;height:${h}px" class="adnm-tag"` +
+    ` data-adnm-cc="${creativeCode}" data-adnm-type="${type || ""}" data-adnm-click=""` +
+    ` data-adnm-session="${ts}" data-adnm-unload="" data-adnm-custom-adnm_preview="link">` +
+    `<script async src="${ADNAMI_ENGINE_SRC}"><\/script></ins>`;
+  const doc = `<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0">${ins}</body></html>`;
+  return "data:text/html;charset=utf-8," + encodeURIComponent(doc);
 }
 
 // Build ONE clean *preview* ins-tag and load the Adnami render engine, then wait
@@ -348,44 +321,32 @@ async function injectAdnami(page, creativeCode, placement) {
   const ctxReady = await loadAdnamiContext(page);
   await page.waitForTimeout(300);
 
-  // PHASE 2 — now insert the ins-tag and load the render engine, so the engine
-  // finds a ready context and a creative code to render.
-  const result = await page.evaluate(({ creativeCode, spec, engineSrc, placement }) => {
-    const ins = document.createElement("ins");
-    ins.className = "adnm-tag";
-    ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px;`;
-    ins.setAttribute("data-adnm-cc", creativeCode);
-    if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-    ins.setAttribute("data-adnm-session", String(Date.now())); // cachebuster, like real tags
-    ins.setAttribute("data-adnm-preview", ""); // force THIS creative regardless of live booking
-    ins.setAttribute("data-cx-injected", ""); // our marker, so pick-placement can replace it
-
-    let host = null, prepend = false;
+  // PHASE 2 — render the creative INSIDE its own data: iframe (an isolated ad slot),
+  // exactly like the Adnami extension. Default placement is the top of <body>.
+  const src = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
+  const result = await page.evaluate(({ src, w, h, placement }) => {
+    document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+    let host = null;
     if (placement) { try { host = document.querySelector(placement); } catch (e) { host = null; } }
-    if (!host) { host = document.body; prepend = true; }
-    if (!host) return { ok: false, reason: "no-host" };
-    if (prepend && host.firstChild) host.insertBefore(ins, host.firstChild);
-    else host.appendChild(ins);
+    const frame = document.createElement("iframe");
+    frame.setAttribute("adnm-preview-adunit", "true");
+    frame.setAttribute("data-cx-injected", "");
+    frame.setAttribute("scrolling", "no");
+    frame.style.cssText = "width:" + w + "px;height:" + h + "px;border:0;display:block;margin:0 auto;max-width:100%;";
+    if (host) host.replaceChildren(frame);
+    else document.body.insertBefore(frame, document.body.firstChild);
+    frame.src = src;
+    return { ok: true, placed: host ? "slot" : "body-top", w, h };
+  }, { src, w: spec.width, h: spec.height, placement: placement || "" });
 
-    // The engine <script> goes INSIDE the <ins>, exactly like the real Adnami tag —
-    // the engine uses its parent <ins> to know which creative to render. Placing it
-    // in <head> left it parentless → "missing_creative_code".
-    const s = document.createElement("script");
-    s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-    ins.appendChild(s);
-    return { ok: true, type: spec.type, w: spec.width, h: spec.height };
-  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "" });
+  if (!result || !result.ok) throw new Error("Kunne ikke indsætte Adnami-preview" + (fetchNote ? (" (" + fetchNote + ")") : ""));
 
-  if (!result || !result.ok) throw new Error("Kunne ikke indsætte Adnami-creative på siden" + (fetchNote ? (" (" + fetchNote + ")") : ""));
-
-  // Adnami mounts the creative inside an <iframe id="adsm-iframe-…">.
-  const mounted = await page.waitForFunction(
-    () => !!document.querySelector('iframe[id^="adsm-iframe"], iframe[id*="adnm"], ins.adnm-tag iframe, [data-adnm-rendered]'),
-    { timeout: 12000 }
-  ).then(() => true).catch(() => false);
-  await page.waitForTimeout(2000); // let expansion / animation settle
-  const skinFid = await maybeRevealSkin(page); // auto-detects skin/wallpaper formats and reveals them
-  return { ...result, mounted, ctxReady, fetchNote, skinFid };
+  // Let the creative load inside its iframe and (for high-impact) break out to the page.
+  await page.waitForTimeout(5000);
+  const mounted = await page.evaluate(
+    () => !!document.querySelector('iframe[id^="adsm-iframe"], iframe[id*="adnm"], [data-adnm-fid]')
+  ).catch(() => false);
+  return { ...result, mounted, ctxReady, fetchNote };
 }
 
 // Re-place the creative at a clicked point (device CSS px). To guarantee the ad
@@ -433,43 +394,32 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
   let spec = { width: 300, height: 240, type: "" };
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
 
-  // 4) Inject ONCE, replacing the captured slot (or body-top if it's gone).
-  const result = await page.evaluate(({ creativeCode, spec, engineSrc, selector }) => {
+  // 4) Render the creative in its own data: iframe, replacing the captured slot.
+  const src = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
+  const result = await page.evaluate(({ src, w, h, selector }) => {
+    document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
     let slot = null;
     if (selector) { try { slot = document.querySelector(selector); } catch (e) { slot = null; } }
-
-    const ins = document.createElement("ins");
-    ins.className = "adnm-tag";
-    ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px;`;
-    ins.setAttribute("data-adnm-cc", creativeCode);
-    if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-    ins.setAttribute("data-adnm-session", String(Date.now()));
-    ins.setAttribute("data-adnm-preview", "");
-    ins.setAttribute("data-cx-injected", "");
-
+    const frame = document.createElement("iframe");
+    frame.setAttribute("adnm-preview-adunit", "true");
+    frame.setAttribute("data-cx-injected", "");
+    frame.setAttribute("scrolling", "no");
+    frame.style.cssText = "width:" + w + "px;height:" + h + "px;border:0;display:block;margin:0 auto;max-width:100%;";
     let mode;
-    if (!slot || slot === document.body || !slot.parentNode) {
-      document.body.insertBefore(ins, document.body.firstChild); mode = "body-top";
-    } else if (slot.tagName === "IFRAME" || slot.tagName === "IMG" || slot.tagName === "VIDEO") {
-      slot.replaceWith(ins); mode = "replace-node"; // swap the ad element itself
-    } else {
-      slot.replaceChildren(ins); mode = "replace-content"; // clear the slot, put ours inside
-    }
-    const s = document.createElement("script");
-    s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-    ins.appendChild(s);
+    if (!slot || slot === document.body || !slot.parentNode) { document.body.insertBefore(frame, document.body.firstChild); mode = "body-top"; }
+    else if (slot.tagName === "IFRAME" || slot.tagName === "IMG" || slot.tagName === "VIDEO") { slot.replaceWith(frame); mode = "replace-node"; }
+    else { slot.replaceChildren(frame); mode = "replace-content"; }
+    frame.src = src;
     return { ok: true, mode, matchedSlot: !!slot };
-  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, selector });
+  }, { src, w: spec.width, h: spec.height, selector });
 
-  // 5) Wait for mount, then scroll it into view so the user sees it in place.
-  const mounted = await page.waitForFunction(
-    () => !!document.querySelector('iframe[id^="adsm-iframe"], ins.adnm-tag iframe, [data-adnm-rendered]'),
-    { timeout: 10000 }
-  ).then(() => true).catch(() => false);
-  await page.waitForTimeout(1200);
-  await maybeRevealSkin(page); // in case the picked creative is a skin/wallpaper
+  // 5) Let it load, then scroll it into view so the user sees it in place.
+  await page.waitForTimeout(5000);
+  const mounted = await page.evaluate(
+    () => !!document.querySelector('iframe[id^="adsm-iframe"], [data-adnm-fid]')
+  ).catch(() => false);
   await page.evaluate(() => {
-    const i = document.querySelector("ins[data-cx-injected]");
+    const i = document.querySelector("[data-cx-injected]");
     if (i && i.scrollIntoView) i.scrollIntoView({ block: "center" });
   }).catch(() => {});
   return { ...result, mounted, ctxReady, selector };
@@ -628,43 +578,27 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
     let spec = { width: 300, height: 240, type: "" };
     try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creative)); } catch (e) { out.injectError = String(e.message || e); }
     out.spec = spec;
-    // Phase 1: load the domain macro, then wait for the context to initialise.
-    await page.evaluate(() => {
-      const h = window.location.host;
-      const multiTld = /\.(co\.uk|gov\.uk|com\.uk|org\.uk|com\.vn|net\.vn|com\.ar|co\.jp|com\.au|org\.au|com\.cn|edu\.cn|gov\.cn|ac\.jp|co\.kr|or\.kr|go\.kr|com\.mx|org\.mx|co\.nz|org\.nz|gov\.nz|net\.nz|co\.il|com\.es|com\.br|com\.hk|com\.gr|com\.uy|info\.pl|com\.do|com\.tr|com\.ec)$/.test(h);
-      const domain = multiTld ? h.split(".").slice(-3).join(".") : h.split(".").slice(-2).join(".");
-      const macro = document.createElement("script");
-      macro.async = true; macro.type = "text/javascript";
-      macro.src = "https://functions.adnami.io/api/macro/adsm.macro." + domain + ".js";
-      macro.setAttribute("adnm-lite", ""); macro.setAttribute("data-adnm-macro", "");
-      (document.head || document.documentElement).appendChild(macro);
-    }).catch(() => {});
-    out.ctxReady = await page.waitForFunction(() => {
-      try { const a = (window.top && window.top.adsm) || window.adsm; return !!(a && a.certifications); }
-      catch (e) { return !!(window.adsm && window.adsm.certifications); }
-    }, { timeout: 8000 }).then(() => true).catch(() => false);
-    // Phase 2: insert the ins-tag with the engine <script> INSIDE it (real tag shape).
-    await page.evaluate(({ creativeCode, spec, engineSrc }) => {
-      const ins = document.createElement("ins");
-      ins.className = "adnm-tag";
-      ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px;`;
-      ins.setAttribute("data-adnm-cc", creativeCode);
-      if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-      ins.setAttribute("data-adnm-session", String(Date.now()));
-      ins.setAttribute("data-adnm-preview", "");
-      document.body.insertBefore(ins, document.body.firstChild);
-      const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-      ins.appendChild(s);
-    }, { creativeCode: creative, spec, engineSrc: ADNAMI_ENGINE_SRC }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
-    await page.waitForTimeout(5500); // let the engine render into the ready context
-    out.skinFid = await maybeRevealSkin(page); // auto-detects + reveals skins
+    // Phase 1: load the domain macro on the TOP page + wait for the context.
+    out.ctxReady = await loadAdnamiContext(page);
+    // Phase 2: render the creative inside its own data: iframe (extension method).
+    const src = adnamiPreviewSrc(creative, spec.type, spec.width, spec.height, Date.now());
+    await page.evaluate(({ src, w, h }) => {
+      document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+      const frame = document.createElement("iframe");
+      frame.setAttribute("adnm-preview-adunit", "true");
+      frame.setAttribute("data-cx-injected", "");
+      frame.style.cssText = "width:" + w + "px;height:" + h + "px;border:0;display:block;margin:0 auto;max-width:100%;";
+      document.body.insertBefore(frame, document.body.firstChild);
+      frame.src = src;
+    }, { src, w: spec.width, h: spec.height }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
+    await page.waitForTimeout(5500); // let the engine render inside the iframe + break out
     out.dom = await page.evaluate(() => {
-      const ins = document.querySelector("ins.adnm-tag");
       let adsm = null;
       try { adsm = (window.top && window.top.adsm) || window.adsm || null; } catch (e) { adsm = window.adsm || null; }
+      const fidEl = document.querySelector("[data-adnm-fid]");
       return {
-        insHTML: ins ? ins.outerHTML.slice(0, 500) : null,
-        insChildCount: ins ? ins.children.length : 0,
+        previewFrame: !!document.querySelector("iframe[data-cx-injected]"),
+        fid: fidEl ? (fidEl.getAttribute("data-adnm-fid") || "") : "",
         adsmPresent: !!adsm,
         adsmHasCertifications: !!(adsm && adsm.certifications),
         adsmCertKeys: adsm && adsm.certifications ? Object.keys(adsm.certifications).slice(0, 25) : [],
