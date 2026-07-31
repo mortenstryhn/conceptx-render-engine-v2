@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.18.1-slots-check";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.18.2-consent";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -155,9 +155,47 @@ const CONSENT_SELECTORS = [
   ".fc-cta-consent",                       // Google Funding Choices
   "#sp-cc-accept",                          // Sourcepoint
   "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", // Cookiebot
+  "#CybotCookiebotDialogBodyButtonAccept",                  // Cookiebot "Allow all"
+  "#CybotCookiebotDialogBodyLevelButtonAccept",             // Cookiebot variant
+  "#CybotCookiebotDialogBodyButtonAcceptAll",               // Cookiebot variant
   "button[data-testid='uc-accept-all-button']",             // Usercentrics
   "button[mode='primary']",
 ];
+
+// Give proper GDPR/TCF consent so the page's ad auction actually serves ads.
+// valdemarsro uses Cookiebot (IAB TCF) — accept via its JS API AND the banner button.
+async function giveConsent(page) {
+  await page.evaluate(() => {
+    try {
+      if (window.Cookiebot) {
+        if (typeof window.Cookiebot.submitCustomConsent === "function") window.Cookiebot.submitCustomConsent(true, true, true);
+        else if (window.Cookiebot.dialog && typeof window.Cookiebot.dialog.submitConsent === "function") window.Cookiebot.dialog.submitConsent();
+      }
+      if (window.CookiebotDialog && window.CookiebotDialog.submitConsentButton) window.CookiebotDialog.submitConsentButton.click();
+    } catch (e) {}
+  }).catch(() => {});
+  await dismissConsent(page).catch(() => {});
+  // small settle so the CMP writes the TCF string before the ad auction runs
+  await page.waitForTimeout(1200);
+}
+
+// Report whether a valid TCF consent string is now present (for diagnostics).
+async function consentState(page) {
+  return await page.evaluate(() => new Promise((resolve) => {
+    const out = { tcfApi: typeof window.__tcfapi === "function", cookiebot: !!window.Cookiebot, consented: null, gdprApplies: null };
+    if (!out.tcfApi) return resolve(out);
+    try {
+      let settled = false;
+      window.__tcfapi("getTCData", 2, (d, ok) => {
+        settled = true;
+        out.gdprApplies = d && d.gdprApplies;
+        out.consented = !!(d && d.tcString && d.tcString.length > 20);
+        resolve(out);
+      });
+      setTimeout(() => { if (!settled) resolve(out); }, 2500);
+    } catch (e) { resolve(out); }
+  })).catch(() => ({ error: true }));
+}
 
 async function tryConsentIn(frame) {
   for (const sel of CONSENT_SELECTORS) {
@@ -701,13 +739,16 @@ app.get("/adnm-slots", async (req, res) => {
   const out = { version: ENGINE_VERSION, url: safeUrl };
   try {
     try { await page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 25000 }); } catch (e) { out.gotoNote = String(e.message || e); }
-    await dismissConsent(page).catch(() => {});
-    await page.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 900); y += 900; if (y > 9000) { clearInterval(t); r(); } }, 120); setTimeout(() => { clearInterval(t); r(); }, 6500); })).catch(() => {});
-    await page.waitForTimeout(1500);
+    await giveConsent(page);
+    out.consent = await consentState(page);
+    // Slower scroll that dwells, so lazy-loaded ad slots have time to fill.
+    await page.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 500); y += 500; if (y > 11000) { clearInterval(t); r(); } }, 350); setTimeout(() => { clearInterval(t); r(); }, 11000); })).catch(() => {});
+    await page.waitForTimeout(2500);
     Object.assign(out, await page.evaluate(() => ({
       slotCount: document.querySelectorAll('iframe[id^="adsm-iframe"]').length,
       slotIds: Array.from(document.querySelectorAll('iframe[id^="adsm-iframe"]')).slice(0, 12).map((s) => s.id),
       insAdnmTags: document.querySelectorAll("ins.adnm-tag").length,
+      anyAdIframes: document.querySelectorAll('iframe[id*="google_ads"], iframe[src*="doubleclick"], iframe[id*="adsm"], iframe[id*="adnm"]').length,
       adnamiScripts: Array.from(document.querySelectorAll('script[src*="adnami"]')).map((s) => s.src.slice(0, 130)).slice(0, 20),
       webdriver: navigator.webdriver === true,
     })));
