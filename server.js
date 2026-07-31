@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.15-skin-css";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.16-skin-wrappers";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -270,15 +270,47 @@ function parseAdnamiSpec(text) {
 // own opaque background hides it in the margins. We make html/body transparent with
 // CSS only (NO node moving — that would trip the format's self-destruct watchdog),
 // so the wallpaper shows in the left/right margins around the centered content.
-async function revealSkinCss(page) {
-  await page.evaluate(() => {
-    if (document.getElementById("cx-skin-css")) return;
-    const st = document.createElement("style");
-    st.id = "cx-skin-css";
-    st.textContent =
-      "html,body{background-color:transparent !important;background-image:none !important;}";
-    (document.head || document.documentElement).appendChild(st);
-  }).catch(() => {});
+async function revealSkinCss(page, contentWidth) {
+  await page.evaluate((contentW) => {
+    if (!document.getElementById("cx-skin-css")) {
+      const st = document.createElement("style");
+      st.id = "cx-skin-css";
+      st.textContent = "html,body{background-color:transparent !important;background-image:none !important;}";
+      (document.head || document.documentElement).appendChild(st);
+    }
+    const vw = window.innerWidth;
+    const isAdnami = (el) =>
+      /adnm|adsm/i.test(el.id || "") ||
+      (typeof el.className === "string" && /adnm|adsm/i.test(el.className)) ||
+      el.hasAttribute("data-cx-injected");
+    const opaque = (cs) => {
+      const c = cs.backgroundColor;
+      const hasColor = c && c !== "rgba(0, 0, 0, 0)" && c !== "transparent";
+      const hasImg = cs.backgroundImage && cs.backgroundImage !== "none";
+      return hasColor || hasImg;
+    };
+    // Constrain the site's OWN opaque full-width wrappers to a centered column so the
+    // skin (a separate full-width layer behind them) shows in the margins. Descend
+    // through transparent full-width containers to reach the real opaque wrappers.
+    const constrain = (root, depth) => {
+      if (depth > 5) return;
+      for (const el of Array.from(root.children)) {
+        if (el.nodeType !== 1) continue;
+        if (isAdnami(el) || el.tagName === "SCRIPT" || el.tagName === "STYLE" || el.tagName === "LINK") continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < vw * 0.9) continue; // not a full-width wrapper
+        const cs = getComputedStyle(el);
+        if (opaque(cs)) {
+          el.style.setProperty("max-width", contentW + "px", "important");
+          el.style.setProperty("margin-left", "auto", "important");
+          el.style.setProperty("margin-right", "auto", "important");
+        } else {
+          constrain(el, depth + 1); // transparent container → look inside
+        }
+      }
+    };
+    constrain(document.body, 0);
+  }, Math.max(600, parseInt(contentWidth, 10) || 1010)).catch(() => {});
   await page.waitForTimeout(400);
 }
 
