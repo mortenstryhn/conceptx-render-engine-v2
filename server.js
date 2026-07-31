@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.18.4-consent-wait";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.19-consent-in-render";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -422,20 +422,22 @@ function adnamiPreviewSrc(creativeCode, type, w, h, ts) {
 // for a real slot iframe (id "adsm-iframe-…") to appear. These are the "green boxes"
 // the extension lets you click. Returns true if at least one real slot exists.
 async function loadPageAds(page) {
+  // Slow, dwelling scroll so the ad auction runs and lazy Adnami slots fill.
   await page.evaluate(async () => {
     await new Promise((res) => {
-      let y = 0, ticks = 0; const step = 700;
+      let y = 0, ticks = 0; const step = 500;
       const t = setInterval(() => {
         window.scrollBy(0, step); y += step; ticks++;
-        if (y >= document.body.scrollHeight - window.innerHeight || ticks > 45) { clearInterval(t); res(); }
-      }, 150);
-      setTimeout(() => { clearInterval(t); res(); }, 10000);
+        if (document.querySelector('iframe[id^="adsm-iframe"]') && ticks > 6) { clearInterval(t); res(); return; }
+        if (y >= document.body.scrollHeight - window.innerHeight || ticks > 60) { clearInterval(t); res(); }
+      }, 300);
+      setTimeout(() => { clearInterval(t); res(); }, 16000);
     });
     window.scrollTo(0, 0);
   }).catch(() => {});
   return await page.waitForFunction(
     () => !!document.querySelector('iframe[id^="adsm-iframe"]'),
-    { timeout: 15000 }
+    { timeout: 12000 }
   ).then(() => true).catch(() => false);
 }
 
@@ -659,7 +661,8 @@ async function renderShot({ url, device, landscape, fullPage, format, manualCons
 
   const work = (async () => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-    if (!manualConsent) await dismissConsent(page);
+    // For creative previews we need REAL ads → give proper TCF consent; else just dismiss.
+    if (!manualConsent) { if (creative) await giveConsent(page); else await dismissConsent(page); }
     // give ad tags a moment, then scroll to trigger lazy slots, then settle
     await page.waitForTimeout(1200);
     // Inject the chosen Adnami creative before scrolling so lazy formats mount.
@@ -1062,7 +1065,7 @@ function setupLive(httpServer) {
           }
 
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => {});
-          if (!manualConsent) await dismissConsent(page);
+          if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); }
           await doInject();
         }
         else if (!page) { return; }
