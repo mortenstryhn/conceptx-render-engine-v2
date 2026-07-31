@@ -40,7 +40,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.17-adnm-preview-link";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.18-real-slot";                                    // bump when deploying; visible at /health
 
 const app = express();
 app.disable("x-powered-by");
@@ -363,51 +363,101 @@ function adnamiPreviewSrc(creativeCode, type, w, h, ts) {
 // This mirrors what the "Adnami Tool" browser extension does, server-side.
 // `placement` is an optional CSS selector; when it matches an element the creative
 // is appended there, otherwise it is placed at the top of <body>.
+// Scroll the page to trigger the SITE'S OWN lazy-loaded Adnami ad slots, then wait
+// for a real slot iframe (id "adsm-iframe-…") to appear. These are the "green boxes"
+// the extension lets you click. Returns true if at least one real slot exists.
+async function loadPageAds(page) {
+  await page.evaluate(async () => {
+    await new Promise((res) => {
+      let y = 0, ticks = 0; const step = 700;
+      const t = setInterval(() => {
+        window.scrollBy(0, step); y += step; ticks++;
+        if (y >= document.body.scrollHeight - window.innerHeight || ticks > 45) { clearInterval(t); res(); }
+      }, 150);
+      setTimeout(() => { clearInterval(t); res(); }, 10000);
+    });
+    window.scrollTo(0, 0);
+  }).catch(() => {});
+  return await page.waitForFunction(
+    () => !!document.querySelector('iframe[id^="adsm-iframe"]'),
+    { timeout: 15000 }
+  ).then(() => true).catch(() => false);
+}
+
+// Preview a creative on the page — the EXTENSION's method: let the site load its own
+// Adnami ad slots, then anchor the preview in a REAL slot by cloning its iframe and
+// pointing it at a data: document that carries the preview ins-tag. Running inside a
+// real, fully-initialised Adnami placement is what lets high-impact formats (incl.
+// skins) perform their full page takeover. Falls back to a synthetic tag if the page
+// has no live Adnami slot.
 async function injectAdnami(page, creativeCode, placement) {
   let spec = { width: 300, height: 240, type: "" };
   let fetchNote = "";
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); }
-  catch (e) { fetchNote = String(e.message || e); } // non-fatal: still try a preview tag by creative id
+  catch (e) { fetchNote = String(e.message || e); }
 
-  // PHASE 1 — load the domain macro + wait for the render context to initialise.
-  const ctxReady = await loadAdnamiContext(page);
-  await page.waitForTimeout(300);
+  const hasSlot = await loadPageAds(page); // let the site's own real Adnami slots load
+  const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
+  let result = null, method = "";
 
-  // PHASE 2 — inject the preview ins-tag directly on the page with the extension's
-  // EXACT attributes (esp. data-adnm-custom-adnm_preview="link"), then leave it alone.
-  // That preview flag makes the top-page engine perform the format's own takeover —
-  // for a skin: the centered content column + side wings, built by Adnami itself.
-  const result = await page.evaluate(({ creativeCode, spec, engineSrc, placement }) => {
-    document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
-    const ins = document.createElement("ins");
-    ins.className = "adnm-tag";
-    ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
-    ins.setAttribute("data-adnm-cc", creativeCode);
-    if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-    ins.setAttribute("data-adnm-click", "");
-    ins.setAttribute("data-adnm-session", String(Date.now()));
-    ins.setAttribute("data-adnm-unload", "");
-    ins.setAttribute("data-adnm-custom-adnm_preview", "link"); // the extension's preview trigger
-    ins.setAttribute("data-cx-injected", "");
-    let host = null, prepend = false;
-    if (placement) { try { host = document.querySelector(placement); } catch (e) { host = null; } }
-    if (!host) { host = document.body; prepend = true; }
-    if (prepend && host.firstChild) host.insertBefore(ins, host.firstChild);
-    else host.appendChild(ins);
-    const s = document.createElement("script");
-    s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-    ins.appendChild(s);
-    return { ok: true };
-  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "" });
+  if (hasSlot) {
+    // PRIMARY — replace a REAL Adnami slot's iframe with the preview (extension inject()).
+    result = await page.evaluate(({ dataUrl, placement }) => {
+      document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+      let target = null;
+      if (placement) {
+        try {
+          const host = document.querySelector(placement);
+          if (host) target = (host.tagName === "IFRAME" && /^adsm-iframe/.test(host.id)) ? host : host.querySelector('iframe[id^="adsm-iframe"]');
+        } catch (e) {}
+      }
+      if (!target) target = document.querySelector('iframe[id^="adsm-iframe"]');
+      if (!target) return { ok: false, reason: "no-slot" };
+      const clone = target.cloneNode();
+      clone.setAttribute("src", dataUrl);
+      clone.setAttribute("adnm-preview-adunit", "true");
+      clone.setAttribute("data-cx-injected", "");
+      target.replaceWith(clone);
+      return { ok: true };
+    }, { dataUrl, placement: placement || "" });
+    method = "real-slot";
+  }
 
-  if (!result || !result.ok) throw new Error("Kunne ikke indsætte Adnami-preview" + (fetchNote ? (" (" + fetchNote + ")") : ""));
+  if (!hasSlot || !result || !result.ok) {
+    // FALLBACK — no live slot: load the domain macro + a synthetic preview ins-tag.
+    await loadAdnamiContext(page);
+    await page.waitForTimeout(300);
+    result = await page.evaluate(({ creativeCode, spec, engineSrc, placement }) => {
+      document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+      const ins = document.createElement("ins");
+      ins.className = "adnm-tag";
+      ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
+      ins.setAttribute("data-adnm-cc", creativeCode);
+      if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+      ins.setAttribute("data-adnm-click", "");
+      ins.setAttribute("data-adnm-session", String(Date.now()));
+      ins.setAttribute("data-adnm-unload", "");
+      ins.setAttribute("data-adnm-custom-adnm_preview", "link");
+      ins.setAttribute("data-cx-injected", "");
+      let host = null, prepend = false;
+      if (placement) { try { host = document.querySelector(placement); } catch (e) { host = null; } }
+      if (!host) { host = document.body; prepend = true; }
+      if (prepend && host.firstChild) host.insertBefore(ins, host.firstChild); else host.appendChild(ins);
+      const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
+      ins.appendChild(s);
+      return { ok: true };
+    }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "" });
+    method = "fallback-ins";
+  }
 
-  // Give the format (esp. a skin's page takeover) time to build — do NOT touch the DOM.
-  await page.waitForTimeout(7000);
+  if (!result || !result.ok) throw new Error("Kunne ikke forankre Adnami-preview på siden" + (fetchNote ? (" (" + fetchNote + ")") : ""));
+
+  // Let the format take over — do NOT touch the DOM.
+  await page.waitForTimeout(8000);
   const mounted = await page.evaluate(
-    () => !!document.querySelector('.adsm-sticky-wrapper, .adsm-wallpaper, iframe[id^="adsm-iframe"], [data-adnm-fid]')
+    () => !!document.querySelector('.adsm-sticky-wrapper, [class*="adsm-wallpaper"], [data-adnm-fid]')
   ).catch(() => false);
-  return { ...result, mounted, ctxReady, fetchNote, isSkin: spec.isSkin };
+  return { ok: true, mounted, method, hasSlot, fetchNote, isSkin: spec.isSkin };
 }
 
 // Re-place the creative at a clicked point (device CSS px). To guarantee the ad
@@ -444,52 +494,78 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
     return slot === document.body ? "" : cssPath(slot);
   }, { x: Math.round(x), y: Math.round(y) });
 
-  // 2) Clean slate: reload so the previous render leaves nothing behind.
+  // 2) Clean slate: reload so the previous preview leaves nothing behind.
   await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => {});
   await dismissConsent(page).catch(() => {});
   await page.waitForTimeout(800);
 
-  // 3) Reload context + fetch spec.
-  const ctxReady = await loadAdnamiContext(page);
-  await page.waitForTimeout(300);
+  // 3) Let the site's own Adnami slots load + fetch spec.
+  const hasSlot = await loadPageAds(page);
   let spec = { width: 300, height: 240, type: "" };
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
+  const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
 
-  // 4) Inject the preview ins-tag (extension attributes) at the captured slot.
-  const result = await page.evaluate(({ creativeCode, spec, engineSrc, selector }) => {
-    document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
-    let slot = null;
-    if (selector) { try { slot = document.querySelector(selector); } catch (e) { slot = null; } }
-    const ins = document.createElement("ins");
-    ins.className = "adnm-tag";
-    ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
-    ins.setAttribute("data-adnm-cc", creativeCode);
-    if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-    ins.setAttribute("data-adnm-click", "");
-    ins.setAttribute("data-adnm-session", String(Date.now()));
-    ins.setAttribute("data-adnm-unload", "");
-    ins.setAttribute("data-adnm-custom-adnm_preview", "link");
-    ins.setAttribute("data-cx-injected", "");
-    let mode;
-    if (!slot || slot === document.body || !slot.parentNode) { document.body.insertBefore(ins, document.body.firstChild); mode = "body-top"; }
-    else if (slot.tagName === "IFRAME" || slot.tagName === "IMG" || slot.tagName === "VIDEO") { slot.replaceWith(ins); mode = "replace-node"; }
-    else { slot.replaceChildren(ins); mode = "replace-content"; }
-    const s = document.createElement("script");
-    s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-    ins.appendChild(s);
-    return { ok: true, mode, matchedSlot: !!slot };
-  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, selector });
+  // 4) Replace the REAL Adnami slot nearest the clicked spot (extension method).
+  let result = null;
+  if (hasSlot) {
+    result = await page.evaluate(({ dataUrl, selector }) => {
+      document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+      const slots = Array.from(document.querySelectorAll('iframe[id^="adsm-iframe"]'));
+      if (!slots.length) return { ok: false, reason: "no-slot" };
+      let target = slots[0];
+      if (selector) {
+        try {
+          const host = document.querySelector(selector);
+          if (host) {
+            const hc = host.getBoundingClientRect(); const hy = (hc.top + hc.bottom) / 2;
+            let best = null, bestD = Infinity;
+            for (const s of slots) { const r = s.getBoundingClientRect(); const d = Math.abs((r.top + r.bottom) / 2 - hy); if (d < bestD) { bestD = d; best = s; } }
+            if (best) target = best;
+          }
+        } catch (e) {}
+      }
+      const clone = target.cloneNode();
+      clone.setAttribute("src", dataUrl);
+      clone.setAttribute("adnm-preview-adunit", "true");
+      clone.setAttribute("data-cx-injected", "");
+      target.replaceWith(clone);
+      return { ok: true };
+    }, { dataUrl, selector });
+  }
+  if (!hasSlot || !result || !result.ok) {
+    await loadAdnamiContext(page);
+    await page.waitForTimeout(300);
+    result = await page.evaluate(({ creativeCode, spec, engineSrc, selector }) => {
+      document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+      let slot = null;
+      if (selector) { try { slot = document.querySelector(selector); } catch (e) { slot = null; } }
+      const ins = document.createElement("ins");
+      ins.className = "adnm-tag";
+      ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
+      ins.setAttribute("data-adnm-cc", creativeCode);
+      if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+      ins.setAttribute("data-adnm-click", ""); ins.setAttribute("data-adnm-session", String(Date.now()));
+      ins.setAttribute("data-adnm-unload", ""); ins.setAttribute("data-adnm-custom-adnm_preview", "link");
+      ins.setAttribute("data-cx-injected", "");
+      if (!slot || slot === document.body || !slot.parentNode) document.body.insertBefore(ins, document.body.firstChild);
+      else if (slot.tagName === "IFRAME" || slot.tagName === "IMG" || slot.tagName === "VIDEO") slot.replaceWith(ins);
+      else slot.replaceChildren(ins);
+      const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
+      ins.appendChild(s);
+      return { ok: true };
+    }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, selector });
+  }
 
   // 5) Let it load / take over, then scroll it into view.
-  await page.waitForTimeout(7000);
+  await page.waitForTimeout(8000);
   const mounted = await page.evaluate(
-    () => !!document.querySelector('.adsm-sticky-wrapper, .adsm-wallpaper, iframe[id^="adsm-iframe"], [data-adnm-fid]')
+    () => !!document.querySelector('.adsm-sticky-wrapper, [class*="adsm-wallpaper"], [data-adnm-fid]')
   ).catch(() => false);
   await page.evaluate(() => {
     const i = document.querySelector("[data-cx-injected]");
     if (i && i.scrollIntoView) i.scrollIntoView({ block: "center" });
   }).catch(() => {});
-  return { ...result, mounted, ctxReady, selector };
+  return { ok: true, mounted, hasSlot, selector };
 }
 
 /* ------------------------------------------------------------------ *
@@ -645,26 +721,39 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
     let spec = { width: 300, height: 240, type: "" };
     try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creative)); } catch (e) { out.injectError = String(e.message || e); }
     out.spec = spec;
-    // Phase 1: load the domain macro on the TOP page + wait for the context.
-    out.ctxReady = await loadAdnamiContext(page);
-    // Phase 2: inject the preview ins-tag with the extension's exact attributes.
-    await page.evaluate(({ creativeCode, spec, engineSrc }) => {
-      document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
-      const ins = document.createElement("ins");
-      ins.className = "adnm-tag";
-      ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
-      ins.setAttribute("data-adnm-cc", creativeCode);
-      if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-      ins.setAttribute("data-adnm-click", "");
-      ins.setAttribute("data-adnm-session", String(Date.now()));
-      ins.setAttribute("data-adnm-unload", "");
-      ins.setAttribute("data-adnm-custom-adnm_preview", "link");
-      ins.setAttribute("data-cx-injected", "");
-      document.body.insertBefore(ins, document.body.firstChild);
-      const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-      ins.appendChild(s);
-    }, { creativeCode: creative, spec, engineSrc: ADNAMI_ENGINE_SRC }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
-    await page.waitForTimeout(7000); // let the format take over — do NOT touch the DOM
+    // Let the site's own Adnami slots load, then anchor the preview in a real slot.
+    out.hasSlot = await loadPageAds(page);
+    out.slotCount = await page.evaluate(() => document.querySelectorAll('iframe[id^="adsm-iframe"]').length).catch(() => 0);
+    const dataUrl = adnamiPreviewSrc(creative, spec.type, spec.width, spec.height, Date.now());
+    if (out.hasSlot) {
+      out.method = "real-slot";
+      await page.evaluate(({ dataUrl }) => {
+        document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+        const target = document.querySelector('iframe[id^="adsm-iframe"]');
+        if (!target) return;
+        const clone = target.cloneNode();
+        clone.setAttribute("src", dataUrl);
+        clone.setAttribute("adnm-preview-adunit", "true");
+        clone.setAttribute("data-cx-injected", "");
+        target.replaceWith(clone);
+      }, { dataUrl }).catch((e) => { out.injectError = (out.injectError || "") + " eval:" + String(e.message || e); });
+    } else {
+      out.method = "fallback-ins";
+      out.ctxReady = await loadAdnamiContext(page);
+      await page.evaluate(({ creativeCode, spec, engineSrc }) => {
+        const ins = document.createElement("ins");
+        ins.className = "adnm-tag";
+        ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
+        ins.setAttribute("data-adnm-cc", creativeCode);
+        if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+        ins.setAttribute("data-adnm-custom-adnm_preview", "link");
+        ins.setAttribute("data-cx-injected", "");
+        document.body.insertBefore(ins, document.body.firstChild);
+        const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
+        ins.appendChild(s);
+      }, { creativeCode: creative, spec, engineSrc: ADNAMI_ENGINE_SRC }).catch(() => {});
+    }
+    await page.waitForTimeout(8000); // let the format take over — do NOT touch the DOM
     out.dom = await page.evaluate(() => {
       let adsm = null;
       try { adsm = (window.top && window.top.adsm) || window.adsm || null; } catch (e) { adsm = window.adsm || null; }
