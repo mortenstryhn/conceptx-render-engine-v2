@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.28-stable-watchdog";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.29-override-siteskin";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -515,6 +515,32 @@ async function loadPageAds(page) {
   ).then(() => true).catch(() => false);
 }
 
+// Remove the site's OWN skin/topscroll takeover so OUR preview creative can become the
+// page skin instead. This is the extension's settingOverrideAdnamiFormats. We keep any
+// .adsm-sticky-wrapper whose wallpaper carries OUR creative code (that's our skin once
+// it builds) and the slot we injected into; everything else (the site's live skin) is
+// removed — and we keep removing for a few seconds in case the site rebuilds it.
+async function clearSiteHighImpact(page, keepCc) {
+  await page.evaluate((keep) => {
+    const clear = () => {
+      try {
+        document.querySelectorAll(".adsm-sticky-wrapper").forEach((n) => {
+          const wp = n.querySelector(".adsm-wallpaper[data-adnm-cc]");
+          const cc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
+          if (keep && cc && cc === keep) return;              // keep OUR skin
+          if (n.querySelector("[data-cx-injected]")) return;  // keep the slot we injected into
+          n.remove();                                          // drop the site's competing skin
+        });
+      } catch (e) {}
+    };
+    clear();
+    if (!window.__cxClearInt) {
+      window.__cxClearInt = setInterval(clear, 400);
+      setTimeout(() => { try { clearInterval(window.__cxClearInt); window.__cxClearInt = null; } catch (e) {} }, 12000);
+    }
+  }, (keepCc || "").toLowerCase()).catch(() => {});
+}
+
 // Preview a creative on the page — the EXTENSION's method: let the site load its own
 // Adnami ad slots, then anchor the preview in a REAL slot by cloning its iframe and
 // pointing it at a data: document that carries the preview ins-tag. Running inside a
@@ -537,6 +563,10 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   // Ensure the engine context exists (lite macro), like the extension's loadAdsv2().
   // Self-skips when the site's own engine is already up, so it's safe/no-op there.
   await loadAdnamiContext(page);
+  // For a SKIN, clear the site's OWN skin/topscroll takeover first (the extension's
+  // settingOverrideAdnamiFormats) — otherwise the site's live campaign keeps the skin
+  // slot and OUR creative never becomes the page takeover.
+  if (spec.isSkin) await clearSiteHighImpact(page, creativeCode);
   const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
   let result = null, method = "";
 
