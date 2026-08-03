@@ -38,7 +38,7 @@ const NAV_TIMEOUT_MS  = parseInt(process.env.NAV_TIMEOUT_MS || "45000", 10);
 const ALLOW_ORIGIN    = process.env.ALLOW_ORIGIN || "*";
 // Real publisher pages are very tall + ad-heavy. Cap capture size so the
 // screenshot bitmap can't blow up memory (a common cause of render failures).
-const MAX_SHOT_HEIGHT = parseInt(process.env.MAX_SHOT_HEIGHT || "6000", 10); // CSS px
+const MAX_SHOT_HEIGHT = parseInt(process.env.MAX_SHOT_HEIGHT || "4500", 10); // CSS px (lower = safer on 512MB)
 const MAX_DSF         = parseFloat(process.env.MAX_DSF || "2");              // cap pixel ratio for screenshots
 const RENDER_TIMEOUT_MS = parseInt(process.env.RENDER_TIMEOUT_MS || "75000", 10);
 const BLOCK_MEDIA     = (process.env.BLOCK_MEDIA || "true") === "true";      // drop video/audio streams (heavy, not needed for a screenshot)
@@ -46,7 +46,13 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.27-real-slot-skin";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.28-stable-watchdog";                                    // bump when deploying; visible at /health
+
+// Never let a single bad render (a thrown Playwright/proxy error in a stray async
+// callback) crash the whole service — that shows up in Render as "Exited with status 1"
+// and takes down every in-flight preview. Log and keep serving instead.
+process.on("uncaughtException", (e) => { try { console.error("uncaughtException:", e && e.stack || e); } catch {} });
+process.on("unhandledRejection", (e) => { try { console.error("unhandledRejection:", e && e.stack || e); } catch {} });
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
@@ -437,6 +443,10 @@ async function revealSkinCss(page, contentWidth) {
 // initialise. Shared by the initial injection and by pick-placement (after reload).
 async function loadAdnamiContext(page) {
   await page.evaluate(() => {
+    // If the site's own Adnami engine is already up (it served ads), reuse it — don't
+    // load a second macro (that risks double-init). Otherwise load the lite macro,
+    // exactly like the extension's loadAdsv2() does before it injects a preview.
+    try { const a = (window.top && window.top.adsm) || window.adsm; if (a && a.certifications) return; } catch (e) {}
     if (document.querySelector("script[data-adnm-macro]")) return;
     const h = window.location.host;
     const multiTld = /\.(co\.uk|gov\.uk|com\.uk|org\.uk|com\.vn|net\.vn|com\.ar|co\.jp|com\.au|org\.au|com\.cn|edu\.cn|gov\.cn|ac\.jp|co\.kr|or\.kr|go\.kr|com\.mx|org\.mx|co\.nz|org\.nz|gov\.nz|net\.nz|co\.il|com\.es|com\.br|com\.hk|com\.gr|com\.uy|info\.pl|com\.do|com\.tr|com\.ec)$/.test(h);
@@ -524,6 +534,9 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   // does. Running inside the site's real skin container is what lets the wings paint;
   // a detached top-level <ins> only ever gets the top band, never the side wings.
   const hasSlot = await loadPageAds(page);
+  // Ensure the engine context exists (lite macro), like the extension's loadAdsv2().
+  // Self-skips when the site's own engine is already up, so it's safe/no-op there.
+  await loadAdnamiContext(page);
   const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
   let result = null, method = "";
 
@@ -555,6 +568,22 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
         try { if (getComputedStyle(p).display === "none") p.style.setProperty("display", "unset", "important"); } catch (e) {}
         p = p.parentElement;
       }
+      // WATCHDOG (extension's ADUNIT_REFRESHED): if the site refreshes the slot and
+      // disconnects our preview, put it straight back. Runs for the render's lifetime.
+      try {
+        const parent = clone.parentElement;
+        if (parent && !window.__cxWatchdog) {
+          const mo = new MutationObserver((muts) => {
+            for (const m of muts) for (const n of m.addedNodes) {
+              if (n && n.nodeType === 1 && n.tagName === "IFRAME" && !n.hasAttribute("adnm-preview-adunit")) {
+                if (!clone.isConnected) { try { n.replaceWith(clone); } catch (e) {} }
+              }
+            }
+          });
+          mo.observe(parent, { childList: true, subtree: true });
+          window.__cxWatchdog = mo;
+        }
+      } catch (e) {}
       return { ok: true };
     }, { dataUrl, placement: placement || "" });
     method = "real-slot";
