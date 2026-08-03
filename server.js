@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.23-skin-clean-field";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.24-skin-warmup-shot";                                    // bump when deploying; visible at /health
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
@@ -525,7 +525,11 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   // assets (overlay_left/right.png) and mount adsm-sticky-wrapper. Non-skins keep the
   // real-slot-first behaviour (best for midscroll etc.).
   const forceTopLevel = !!spec.isSkin;
-  const hasSlot = forceTopLevel ? false : await loadPageAds(page); // let the site's own real Adnami slots load
+  // Always run the page-ads warm-up: it scrolls the page so the site's Adnami engine
+  // (window.adsm / sonar) fully initialises — the injected preview depends on that
+  // engine being ready. For skins we still force the top-level inject (hasSlot=false).
+  const slotFound = await loadPageAds(page);
+  const hasSlot = forceTopLevel ? false : slotFound;
   const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
   let result = null, method = "";
 
@@ -903,6 +907,7 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
   if (!creative) return res.status(400).json({ error: "Mangler ?creative" });
   const device = String(req.query.device || DEFAULT_DEVICE);
   const manualConsent = req.query.consent === "manual";
+  const wantShot = req.query.shot === "1" || req.query.shot === "true"; // return a screenshot instead of JSON
   let safeUrl;
   try { safeUrl = await assertSafeUrl(rawUrl); } catch (e) { return res.status(400).json({ error: e.message }); }
 
@@ -982,6 +987,21 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
         }),
       };
     });
+    // Optional: return a SCREENSHOT of exactly this diagnostic state, so we can SEE
+    // whether the "mounted" skin (DOM flags above) is actually visible with its wings.
+    if (wantShot) {
+      try {
+        let pageH = dev.h;
+        try { pageH = await page.evaluate(() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, window.innerHeight)); } catch {}
+        const capH = Math.max(dev.h, Math.min(pageH, MAX_SHOT_HEIGHT));
+        await page.setViewportSize({ width: dev.w, height: capH });
+        await page.waitForTimeout(600);
+        const buf = await page.screenshot({ type: "jpeg", quality: 82 });
+        res.set("Content-Type", "image/jpeg");
+        res.set("X-Adnami-Skin", String(!!(out.dom && out.dom.wallpaper)));
+        return res.end(buf);
+      } catch (e) { out.shotError = String(e.message || e); }
+    }
     out.consoleMsgs = consoleMsgs;
     out.adnamiReqs = adnamiReqs;
     return res.json(out);
