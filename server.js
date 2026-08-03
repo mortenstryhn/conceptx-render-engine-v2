@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.24-skin-warmup-shot";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.25-skin-minimal-tag";                                    // bump when deploying; visible at /health
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
@@ -567,9 +567,9 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
       ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
       ins.setAttribute("data-adnm-cc", creativeCode);
       if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-      ins.setAttribute("data-adnm-click", "");
-      ins.setAttribute("data-adnm-session", String(Date.now()));
-      ins.setAttribute("data-adnm-unload", "");
+      // MINIMAL preview tag — exactly like the diagnostic inject that renders the skin
+      // with its wings. Do NOT add data-adnm-click / data-adnm-session / data-adnm-unload:
+      // data-adnm-unload in particular makes high-impact formats tear themselves back down.
       ins.setAttribute("data-adnm-custom-adnm_preview", "link");
       ins.setAttribute("data-cx-injected", "");
       let host = null, prepend = false;
@@ -679,8 +679,8 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
       ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
       ins.setAttribute("data-adnm-cc", creativeCode);
       if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-      ins.setAttribute("data-adnm-click", ""); ins.setAttribute("data-adnm-session", String(Date.now()));
-      ins.setAttribute("data-adnm-unload", ""); ins.setAttribute("data-adnm-custom-adnm_preview", "link");
+      // Minimal preview tag (no data-adnm-unload — it makes skins tear themselves down).
+      ins.setAttribute("data-adnm-custom-adnm_preview", "link");
       ins.setAttribute("data-cx-injected", "");
       if (!slot || slot === document.body || !slot.parentNode) document.body.insertBefore(ins, document.body.firstChild);
       else if (slot.tagName === "IFRAME" || slot.tagName === "IMG" || slot.tagName === "VIDEO") slot.replaceWith(ins);
