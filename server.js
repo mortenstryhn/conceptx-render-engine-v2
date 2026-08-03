@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.32-skin-viewport";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.33-skin-widen-viewport";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -667,6 +667,37 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   const mounted = await page.evaluate(
     () => !!document.querySelector('.adsm-sticky-wrapper, [class*="adsm-wallpaper"], [data-adnm-fid]')
   ).catch(() => false);
+  // The seamless skin's wrapper is sometimes sized to the content column (≈1130px) in the
+  // headless engine, so the side wings never reach the outer margins. Widen the wrapper +
+  // wallpaper to the full viewport (leaving the .adsm-wallpaper-l/r side panels' own
+  // left:0 / right:0 offsets, which then land in the true margins). Paired with the
+  // viewport (non-resizing) skin screenshot so this layout isn't undone afterwards.
+  if (spec.isSkin && mounted) {
+    const widen = () => page.evaluate(() => {
+      try {
+        const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+        if (!vw) return;
+        document.querySelectorAll(".adsm-sticky-wrapper").forEach((w) => {
+          w.style.setProperty("width", vw + "px", "important");
+          w.style.setProperty("max-width", "none", "important");
+          w.style.setProperty("left", "0", "important");
+          w.style.setProperty("right", "auto", "important");
+          w.style.setProperty("margin-left", "0", "important");
+          w.style.setProperty("margin-right", "0", "important");
+          w.style.setProperty("transform", "none", "important");
+        });
+        document.querySelectorAll(".adsm-wallpaper").forEach((w) => {
+          if (w.className && /adsm-wallpaper-[lr]/.test(w.className)) return; // side panels keep their own offsets
+          w.style.setProperty("width", "100%", "important");
+          w.style.setProperty("left", "0", "important");
+        });
+      } catch (e) {}
+    }).catch(() => {});
+    await widen();
+    await page.waitForTimeout(600);
+    await widen(); // re-apply in case the engine re-laid-out once after first paint
+    await page.waitForTimeout(300);
+  }
   return { ok: true, mounted, method, hasSlot, fetchNote, isSkin: spec.isSkin };
 }
 
