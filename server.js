@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.22-skin-toplevel";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.23-skin-clean-field";                                    // bump when deploying; visible at /health
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
@@ -511,11 +511,13 @@ async function loadPageAds(page) {
 // real, fully-initialised Adnami placement is what lets high-impact formats (incl.
 // skins) perform their full page takeover. Falls back to a synthetic tag if the page
 // has no live Adnami slot.
-async function injectAdnami(page, creativeCode, placement) {
-  let spec = { width: 300, height: 240, type: "" };
+async function injectAdnami(page, creativeCode, placement, preSpec) {
+  let spec = preSpec || { width: 300, height: 240, type: "" };
   let fetchNote = "";
-  try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); }
-  catch (e) { fetchNote = String(e.message || e); }
+  if (!preSpec) {
+    try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); }
+    catch (e) { fetchNote = String(e.message || e); }
+  }
 
   // Skins take over the TOP document (wings painted in the page's left/right margins);
   // a sandboxed real-slot iframe can't reach out and do that. So for skins we skip the
@@ -733,23 +735,37 @@ async function renderShot({ url, device, landscape, fullPage, format, manualCons
 
   const work = (async () => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-    // For creative previews we need REAL ads → give proper TCF consent; else just dismiss.
-    if (!manualConsent) { if (creative) await giveConsent(page); else await dismissConsent(page); }
+    // Pre-fetch the creative spec so we know up front whether this is a SKIN. A skin
+    // needs a CLEAN field: the site's own high-impact campaign must not win the skin
+    // slot first, so we DON'T wait out the full TCF handshake (which gives the site's
+    // auction a ~10s head start) — we just dismiss the banner and inject immediately,
+    // exactly like the diagnostic path that renders the skin with its wings.
+    let preSpec = null, skinPreview = false;
+    if (creative) {
+      try { preSpec = parseAdnamiSpec(await fetchAdnamiInsTags(creative)); skinPreview = !!preSpec.isSkin; }
+      catch { /* fall back to defaults inside injectAdnami */ }
+    }
+    if (!manualConsent) {
+      if (creative && !skinPreview) await giveConsent(page); // non-skin previews still benefit from real ads
+      else await dismissConsent(page);                        // skins (and no-creative) just clear the banner
+    }
     // give ad tags a moment, then scroll to trigger lazy slots, then settle
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(skinPreview ? 300 : 1200);
     // Inject the chosen Adnami creative before scrolling so lazy formats mount.
     if (creative) {
       try {
-        const r = await injectAdnami(page, creative, placement);
+        const r = await injectAdnami(page, creative, placement, preSpec);
         if (r && r.mounted === false) {
           adnamiError = "creative mountede ikke (ukendt ID, forkert format-type, eller Adnami afviste preview)"
             + (r.fetchNote ? " · " + r.fetchNote : "");
         }
       } catch (e) { adnamiError = String(e.message || e); }
     }
-    await autoScroll(page);
-    await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1500);
+    // For skins, do NOT auto-scroll — the skin is already sticky over the full page and
+    // scrolling only lets the site's own lazy ads load and overwrite it.
+    if (!skinPreview) await autoScroll(page);
+    await page.waitForLoadState("networkidle", { timeout: skinPreview ? 3000 : 8000 }).catch(() => {});
+    await page.waitForTimeout(skinPreview ? 500 : 1500);
 
     // Grow the viewport to the (capped) page height so ALL content — including
     // below-the-fold ads — is laid out and captured. NOTE: a clip that extends
