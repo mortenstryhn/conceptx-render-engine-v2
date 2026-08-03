@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.21-proxy-relay";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.22-skin-toplevel";                                    // bump when deploying; visible at /health
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
@@ -517,7 +517,13 @@ async function injectAdnami(page, creativeCode, placement) {
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); }
   catch (e) { fetchNote = String(e.message || e); }
 
-  const hasSlot = await loadPageAds(page); // let the site's own real Adnami slots load
+  // Skins take over the TOP document (wings painted in the page's left/right margins);
+  // a sandboxed real-slot iframe can't reach out and do that. So for skins we skip the
+  // site's own slots and inject the preview ins at top level — proven to load the wing
+  // assets (overlay_left/right.png) and mount adsm-sticky-wrapper. Non-skins keep the
+  // real-slot-first behaviour (best for midscroll etc.).
+  const forceTopLevel = !!spec.isSkin;
+  const hasSlot = forceTopLevel ? false : await loadPageAds(page); // let the site's own real Adnami slots load
   const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
   let result = null, method = "";
 
@@ -620,10 +626,12 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
   await dismissConsent(page).catch(() => {});
   await page.waitForTimeout(800);
 
-  // 3) Let the site's own Adnami slots load + fetch spec.
-  const hasSlot = await loadPageAds(page);
+  // 3) Fetch spec, then let the site's own Adnami slots load (skipped for skins,
+  //    which always inject at top level so their wings can paint the page margins).
   let spec = { width: 300, height: 240, type: "" };
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
+  const forceTopLevel = !!spec.isSkin;
+  const hasSlot = forceTopLevel ? false : await loadPageAds(page);
   const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
 
   // 4) Replace the REAL Adnami slot nearest the clicked spot (extension method).
