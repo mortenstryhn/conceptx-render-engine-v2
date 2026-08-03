@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.30-same-origin-slot";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.31-skin-fullwidth";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -667,6 +667,33 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   const mounted = await page.evaluate(
     () => !!document.querySelector('.adsm-sticky-wrapper, [class*="adsm-wallpaper"], [data-adnm-fid]')
   ).catch(() => false);
+  // A skin's wallpaper wrapper is sometimes sized to the content column (≈1130px) instead
+  // of the full viewport in the headless engine, so the wings never reach the outer
+  // margins. Force the wrapper + wallpaper to full viewport width so the wings paint the
+  // left/right margins as they do on the live site.
+  if (spec.isSkin && mounted) {
+    await page.evaluate(() => {
+      try {
+        const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+        if (!vw) return;
+        document.querySelectorAll(".adsm-sticky-wrapper").forEach((w) => {
+          w.style.setProperty("width", vw + "px", "important");
+          w.style.setProperty("max-width", "none", "important");
+          w.style.setProperty("left", "0", "important");
+          w.style.setProperty("right", "auto", "important");
+          w.style.setProperty("margin-left", "0", "important");
+          w.style.setProperty("margin-right", "0", "important");
+          w.style.setProperty("transform", "none", "important");
+        });
+        document.querySelectorAll(".adsm-wallpaper, [class*='adsm-wallpaper']").forEach((w) => {
+          if (w.className && /adsm-wallpaper-[lr]/.test(w.className)) return; // leave the side panels' own sizing
+          w.style.setProperty("width", "100%", "important");
+          w.style.setProperty("left", "0", "important");
+        });
+      } catch (e) {}
+    }).catch(() => {});
+    await page.waitForTimeout(400);
+  }
   return { ok: true, mounted, method, hasSlot, fetchNote, isSkin: spec.isSkin };
 }
 
