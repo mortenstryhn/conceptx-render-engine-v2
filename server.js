@@ -25,6 +25,7 @@ import dns from "node:dns/promises";
 import net from "node:net";
 import { WebSocketServer } from "ws";
 import { chromium } from "playwright";
+import ProxyChain from "proxy-chain";
 import { DEVICES, DEFAULT_DEVICE } from "./devices.js";
 
 const PORT            = parseInt(process.env.PORT || "8080", 10);
@@ -45,13 +46,18 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.20-proxy";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.21-proxy-relay";                                    // bump when deploying; visible at /health
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
  * proxy so ad auctions see a real Danish user IP, not a datacenter IP.*
- * Playwright wants credentials split out of the server URL, so if the *
- * PROXY_URL embeds user:pass we lift them into username/password.     *
+ *                                                                     *
+ * Chromium authenticates the proxy per-request and drops the login on *
+ * a subset of the 100+ concurrent third-party ad requests → floods of *
+ * "407 Proxy Authentication Required". To avoid that we DON'T hand the *
+ * upstream login to Chromium; instead we spin up a local auth-less     *
+ * relay (proxy-chain) that injects the login on EVERY request and      *
+ * tunnels to the real proxy. Chromium points at the local relay.       *
  * ------------------------------------------------------------------ */
 function parseProxy() {
   let raw = (process.env.PROXY_URL || "").trim();
@@ -70,8 +76,20 @@ function parseProxy() {
   return proxy;
 }
 const PROXY = parseProxy();
-const proxyInfo = () => PROXY ? { enabled: true, server: PROXY.server, auth: !!PROXY.username } : { enabled: false };
-if (PROXY) console.log(`Proxy aktiv → ${PROXY.server}${PROXY.username ? " (med login)" : ""}`);
+// Full upstream URL WITH credentials, for the local relay (proxy-chain). Credentials
+// are percent-encoded so specials like "+" in the password survive URL parsing.
+function upstreamProxyUrl() {
+  if (!PROXY) return null;
+  const auth = PROXY.username
+    ? `${encodeURIComponent(PROXY.username)}:${encodeURIComponent(PROXY.password || "")}@`
+    : "";
+  return `${PROXY.server.replace("://", "://" + auth)}`;
+}
+let relayUrl = null; // local auth-less proxy URL once the relay is up
+const proxyInfo = () => PROXY
+  ? { enabled: true, server: PROXY.server, auth: !!PROXY.username, relay: !!relayUrl }
+  : { enabled: false };
+if (PROXY) console.log(`Proxy aktiv → ${PROXY.server}${PROXY.username ? " (login via lokal relay)" : ""}`);
 
 const app = express();
 app.disable("x-powered-by");
@@ -82,9 +100,23 @@ app.disable("x-powered-by");
 let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) {
+    // Start the local auth-injecting relay so Chromium never has to answer 407s.
+    let launchProxy = null;
+    const upstream = upstreamProxyUrl();
+    if (upstream) {
+      try {
+        relayUrl = await ProxyChain.anonymizeProxy({ url: upstream, port: 0 });
+        launchProxy = { server: relayUrl }; // auth-less local URL → no per-request 407s
+        console.log("Proxy-relay klar (login håndteres lokalt) → " + relayUrl);
+      } catch (e) {
+        // Fall back to letting Chromium handle the upstream login directly.
+        launchProxy = PROXY;
+        console.log("Proxy-relay kunne ikke starte, bruger direkte proxy-login: " + (e && e.message || e));
+      }
+    }
     browserPromise = chromium.launch({
       executablePath: process.env.CHROMIUM_PATH || undefined, // optional override (local dev); unset in production
-      ...(PROXY ? { proxy: PROXY } : {}), // route every context/page through the proxy when configured
+      ...(launchProxy ? { proxy: launchProxy } : {}), // route every context/page through the (relayed) proxy
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -1174,6 +1206,7 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {
     server.close();
     try { const b = await browserPromise; if (b) await b.close(); } catch {}
+    try { if (relayUrl) await ProxyChain.closeAnonymizedProxy(relayUrl, true); } catch {}
     process.exit(0);
   });
 }
