@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.25-skin-minimal-tag";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.26-skin-suppress-siteads";                                    // bump when deploying; visible at /health
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
@@ -706,10 +706,24 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
 /* ------------------------------------------------------------------ *
  * Render one screenshot                                               *
  * ------------------------------------------------------------------ */
+// The site's OWN high-impact ads (topscroll, its own skin) are delivered through
+// Google's ad stack + common SSPs. For a SKIN preview we block those so the site's
+// live campaign can't win the skin slot and overlap the injected creative. This does
+// NOT match adnami.io, so our own preview delivery (directive/assets/macro) still loads.
+const AD_SUPPRESS_RE = /(^|\.)doubleclick\.net|googlesyndication\.com|googletagservices\.com|google-analytics\.com\/g\/|adservice\.google|adnxs\.com|\.adform\.net|adform\.com|criteo\.|rubiconproject\.com|pubmatic\.com|casalemedia\.com|prebid|cncpt\.dk/i;
+
 async function renderShot({ url, device, landscape, fullPage, format, manualConsent, creative, placement }) {
   const dev = DEVICES[device] || DEVICES[DEFAULT_DEVICE];
   let vw = dev.w, vh = dev.h;
   if (dev.mobile && landscape) { vw = dev.h; vh = dev.w; }
+
+  // Pre-fetch the creative spec up front (plain HTTP, no page needed) so we know BEFORE
+  // loading the page whether this is a skin — that decision drives request filtering.
+  let preSpec = null, skinPreview = false;
+  if (creative) {
+    try { preSpec = parseAdnamiSpec(await fetchAdnamiInsTags(creative)); skinPreview = !!preSpec.isSkin; }
+    catch { /* injectAdnami will retry / use defaults */ }
+  }
 
   const browser = await getBrowser();
   const context = await browser.newContext({
@@ -723,14 +737,14 @@ async function renderShot({ url, device, landscape, fullPage, format, manualCons
     ignoreHTTPSErrors: true,
   });
 
-  // Abort heavy media (video/audio) to save memory — ads' banner/image creatives still load.
-  if (BLOCK_MEDIA) {
-    await context.route("**/*", (route) => {
-      const t = route.request().resourceType();
-      if (t === "media") return route.abort();
-      return route.continue();
-    }).catch(() => {});
-  }
+  // Always drop heavy media (video/audio). For skin previews ALSO block the site's own
+  // ad delivery so only the injected creative renders on a clean field.
+  await context.route("**/*", (route) => {
+    const req = route.request();
+    if (BLOCK_MEDIA && req.resourceType() === "media") return route.abort();
+    if (skinPreview && AD_SUPPRESS_RE.test(req.url())) return route.abort();
+    return route.continue();
+  }).catch(() => {});
 
   const page = await context.newPage();
   const type = format === "png" ? "png" : "jpeg";
@@ -739,16 +753,9 @@ async function renderShot({ url, device, landscape, fullPage, format, manualCons
 
   const work = (async () => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-    // Pre-fetch the creative spec so we know up front whether this is a SKIN. A skin
-    // needs a CLEAN field: the site's own high-impact campaign must not win the skin
-    // slot first, so we DON'T wait out the full TCF handshake (which gives the site's
-    // auction a ~10s head start) — we just dismiss the banner and inject immediately,
-    // exactly like the diagnostic path that renders the skin with its wings.
-    let preSpec = null, skinPreview = false;
-    if (creative) {
-      try { preSpec = parseAdnamiSpec(await fetchAdnamiInsTags(creative)); skinPreview = !!preSpec.isSkin; }
-      catch { /* fall back to defaults inside injectAdnami */ }
-    }
+    // A skin needs a CLEAN field, so we DON'T wait out the full TCF handshake (which
+    // gives the site's auction a head start) — we just dismiss the banner and inject
+    // immediately, exactly like the diagnostic path that renders the skin with its wings.
     if (!manualConsent) {
       if (creative && !skinPreview) await giveConsent(page); // non-skin previews still benefit from real ads
       else await dismissConsent(page);                        // skins (and no-creative) just clear the banner
