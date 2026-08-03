@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.26-skin-suppress-siteads";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.27-real-slot-skin";                                    // bump when deploying; visible at /health
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
@@ -519,17 +519,11 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
     catch (e) { fetchNote = String(e.message || e); }
   }
 
-  // Skins take over the TOP document (wings painted in the page's left/right margins);
-  // a sandboxed real-slot iframe can't reach out and do that. So for skins we skip the
-  // site's own slots and inject the preview ins at top level — proven to load the wing
-  // assets (overlay_left/right.png) and mount adsm-sticky-wrapper. Non-skins keep the
-  // real-slot-first behaviour (best for midscroll etc.).
-  const forceTopLevel = !!spec.isSkin;
-  // Always run the page-ads warm-up: it scrolls the page so the site's Adnami engine
-  // (window.adsm / sonar) fully initialises — the injected preview depends on that
-  // engine being ready. For skins we still force the top-level inject (hasSlot=false).
-  const slotFound = await loadPageAds(page);
-  const hasSlot = forceTopLevel ? false : slotFound;
+  // Let the site load its own Adnami slots (incl. the high-impact skin/topscroll slot).
+  // We then REPLACE that real slot with the preview — exactly what the Adnami extension
+  // does. Running inside the site's real skin container is what lets the wings paint;
+  // a detached top-level <ins> only ever gets the top band, never the side wings.
+  const hasSlot = await loadPageAds(page);
   const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
   let result = null, method = "";
 
@@ -544,6 +538,9 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
           if (host) target = (host.tagName === "IFRAME" && /^adsm-iframe/.test(host.id)) ? host : host.querySelector('iframe[id^="adsm-iframe"]');
         } catch (e) {}
       }
+      // Prefer a high-impact (skin/topscroll) slot: an adsm-iframe inside .adnm-creative,
+      // which is the exact target the Adnami extension replaces. Fall back to any slot.
+      if (!target) target = document.querySelector('.adnm-creative iframe[id^="adsm-iframe"]');
       if (!target) target = document.querySelector('iframe[id^="adsm-iframe"]');
       if (!target) return { ok: false, reason: "no-slot" };
       const clone = target.cloneNode();
@@ -551,6 +548,13 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
       clone.setAttribute("adnm-preview-adunit", "true");
       clone.setAttribute("data-cx-injected", "");
       target.replaceWith(clone);
+      // Un-hide any display:none ancestors so the (skin) creative can lay out — exactly
+      // what the extension does right after replacing the slot.
+      let p = clone.parentElement;
+      while (p && p !== document.body) {
+        try { if (getComputedStyle(p).display === "none") p.style.setProperty("display", "unset", "important"); } catch (e) {}
+        p = p.parentElement;
+      }
       return { ok: true };
     }, { dataUrl, placement: placement || "" });
     method = "real-slot";
@@ -627,17 +631,16 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
     return slot === document.body ? "" : cssPath(slot);
   }, { x: Math.round(x), y: Math.round(y) });
 
-  // 2) Clean slate: reload so the previous preview leaves nothing behind.
+  // 2) Clean slate: reload so the previous preview leaves nothing behind. Give full
+  //    consent so the site re-serves its real ad slots (we replace one of them).
   await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => {});
-  await dismissConsent(page).catch(() => {});
+  await giveConsent(page).catch(() => {});
   await page.waitForTimeout(800);
 
-  // 3) Fetch spec, then let the site's own Adnami slots load (skipped for skins,
-  //    which always inject at top level so their wings can paint the page margins).
+  // 3) Fetch spec, then let the site's own Adnami slots load so we can replace one.
   let spec = { width: 300, height: 240, type: "" };
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
-  const forceTopLevel = !!spec.isSkin;
-  const hasSlot = forceTopLevel ? false : await loadPageAds(page);
+  const hasSlot = await loadPageAds(page);
   const dataUrl = adnamiPreviewSrc(creativeCode, spec.type, spec.width, spec.height, Date.now());
 
   // 4) Replace the REAL Adnami slot nearest the clicked spot (extension method).
@@ -706,12 +709,6 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
 /* ------------------------------------------------------------------ *
  * Render one screenshot                                               *
  * ------------------------------------------------------------------ */
-// The site's OWN high-impact ads (topscroll, its own skin) are delivered through
-// Google's ad stack + common SSPs. For a SKIN preview we block those so the site's
-// live campaign can't win the skin slot and overlap the injected creative. This does
-// NOT match adnami.io, so our own preview delivery (directive/assets/macro) still loads.
-const AD_SUPPRESS_RE = /(^|\.)doubleclick\.net|googlesyndication\.com|googletagservices\.com|google-analytics\.com\/g\/|adservice\.google|adnxs\.com|\.adform\.net|adform\.com|criteo\.|rubiconproject\.com|pubmatic\.com|casalemedia\.com|prebid|cncpt\.dk/i;
-
 async function renderShot({ url, device, landscape, fullPage, format, manualConsent, creative, placement }) {
   const dev = DEVICES[device] || DEVICES[DEFAULT_DEVICE];
   let vw = dev.w, vh = dev.h;
@@ -737,14 +734,15 @@ async function renderShot({ url, device, landscape, fullPage, format, manualCons
     ignoreHTTPSErrors: true,
   });
 
-  // Always drop heavy media (video/audio). For skin previews ALSO block the site's own
-  // ad delivery so only the injected creative renders on a clean field.
-  await context.route("**/*", (route) => {
-    const req = route.request();
-    if (BLOCK_MEDIA && req.resourceType() === "media") return route.abort();
-    if (skinPreview && AD_SUPPRESS_RE.test(req.url())) return route.abort();
-    return route.continue();
-  }).catch(() => {});
+  // Drop heavy media (video/audio) to save memory — ad creatives still load. We do NOT
+  // block the site's own ads: the preview REPLACES the site's real (skin) slot, so that
+  // slot must load first. The site's other ads may coexist — that's intended.
+  if (BLOCK_MEDIA) {
+    await context.route("**/*", (route) => {
+      if (route.request().resourceType() === "media") return route.abort();
+      return route.continue();
+    }).catch(() => {});
+  }
 
   const page = await context.newPage();
   const type = format === "png" ? "png" : "jpeg";
@@ -753,15 +751,14 @@ async function renderShot({ url, device, landscape, fullPage, format, manualCons
 
   const work = (async () => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-    // A skin needs a CLEAN field, so we DON'T wait out the full TCF handshake (which
-    // gives the site's auction a head start) — we just dismiss the banner and inject
-    // immediately, exactly like the diagnostic path that renders the skin with its wings.
+    // Creative previews REPLACE the site's real ad slot, so we give full TCF consent and
+    // let the site's auction serve its slots (incl. the skin/topscroll slot we hijack).
     if (!manualConsent) {
-      if (creative && !skinPreview) await giveConsent(page); // non-skin previews still benefit from real ads
-      else await dismissConsent(page);                        // skins (and no-creative) just clear the banner
+      if (creative) await giveConsent(page);
+      else await dismissConsent(page);
     }
     // give ad tags a moment, then scroll to trigger lazy slots, then settle
-    await page.waitForTimeout(skinPreview ? 300 : 1200);
+    await page.waitForTimeout(1200);
     // Inject the chosen Adnami creative before scrolling so lazy formats mount.
     if (creative) {
       try {
