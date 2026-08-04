@@ -49,7 +49,7 @@ const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // 
 const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width (page still renders at full viewport)
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
-const ENGINE_VERSION  = "2.48-robust-nav";                                         // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.49-midscroll-probe";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -607,8 +607,16 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
     // Matched via Adnami's own format id (data-adnm-fid) — site-agnostic, no slot names.
     const kw = formatKeyword(spec);
     const info = await page.evaluate(({ ourCc, kw, isSkin }) => {
+      const R = (el) => { const r = el.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.left), y: Math.round(r.top) }; };
       const all = Array.from(document.querySelectorAll("[data-adnm-fid]"));
       const fids = all.map((el) => (el.getAttribute("data-adnm-fid") || "").toLowerCase()).filter(Boolean);
+      // Broad diagnostics: what Adnami markup does a running (mid)scroll actually leave in the main doc?
+      const marks = {
+        fids,
+        adsmIframes: Array.from(document.querySelectorAll('iframe[id^="adsm-iframe"], iframe[id*="adnm" i]')).slice(0, 8).map((f) => f.id + "(" + R(f).w + "x" + R(f).h + ")"),
+        adnmClasses: ((document.documentElement.className || "") + " " + (document.body ? document.body.className : "")).split(/\s+/).filter((c) => /adnm|adsm|midscroll|interscroll|topscroll/i.test(c)).slice(0, 10),
+        adnmEls: Array.from(document.querySelectorAll('[class*="midscroll" i],[id*="midscroll" i],[class*="adnm-html" i],[class*="adsm-" i]')).slice(0, 8).map((e) => e.tagName.toLowerCase() + (e.id ? "#" + e.id : "") + (typeof e.className === "string" && e.className ? "." + e.className.trim().split(/\s+/).slice(0, 2).join(".") : "")),
+      };
       let pt = null;
       // SKIN → use the running wallpaper (content-centre, top band of the skin position).
       if (isSkin) {
@@ -624,31 +632,32 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
             pt = { x: cx, y: Math.round(wp.getBoundingClientRect().top + 20) }; break;
           }
         }
-        return { pt, fids, kw };
+        return { pt, marks, kw };
       }
-      // NON-SKIN → find a rendered ad whose format id contains our format keyword, scroll it
-      // into view, and return its centre (so elementFromPoint can resolve its slot).
+      // NON-SKIN → (1) match by fid keyword on any element carrying data-adnm-fid.
+      const tryMatch = (el) => {
+        const cc = (el.getAttribute("data-adnm-cc") || "").toLowerCase();
+        if (cc === ourCc) return false;
+        let r = el.getBoundingClientRect(); if (r.width < 20 || r.height < 20) return false;
+        el.scrollIntoView({ block: "center" }); r = el.getBoundingClientRect();
+        pt = { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + Math.min(r.height / 2, 150)) };
+        return true;
+      };
       if (kw) {
-        for (const el of all) {
-          const fid = (el.getAttribute("data-adnm-fid") || "").toLowerCase();
-          const cc = (el.getAttribute("data-adnm-cc") || "").toLowerCase();
-          if (!fid.includes(kw) || cc === ourCc) continue;
-          let r = el.getBoundingClientRect();
-          if (r.width < 20 || r.height < 20) continue;
-          el.scrollIntoView({ block: "center" });
-          r = el.getBoundingClientRect();
-          pt = { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + Math.min(r.height / 2, 150)) };
-          break;
+        for (const el of all) { const fid = (el.getAttribute("data-adnm-fid") || "").toLowerCase(); if (fid.includes(kw) && tryMatch(el)) break; }
+        // (2) fallback: an element whose class/id mentions the format keyword (e.g. adnm-html-midscroll).
+        if (!pt) {
+          for (const el of Array.from(document.querySelectorAll('[class*="' + kw + '" i],[id*="' + kw + '" i]'))) { if (tryMatch(el)) break; }
         }
       }
-      return { pt, fids, kw };
-    }, { ourCc: (creativeCode || "").toLowerCase(), kw, isSkin: !!spec.isSkin }).catch(() => ({ pt: null, fids: [], kw }));
+      return { pt, marks, kw };
+    }, { ourCc: (creativeCode || "").toLowerCase(), kw, isSkin: !!spec.isSkin }).catch(() => ({ pt: null, marks: {}, kw }));
     if (info && info.pt) {
       const rr = await placeAdnamiAt(page, creativeCode, info.pt.x, info.pt.y, true); // warmed: skip 2nd ad-load
       return { ok: true, mounted: !!(rr && rr.mounted), ours: !!(rr && rr.ours), auto: true, isSkin: !!spec.isSkin };
     }
     // No matching running ad → show the real ads and let the user point the crosshair.
-    return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: !!spec.isSkin, kw, fids: (info && info.fids) || [], formatName: spec.formatName };
+    return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: !!spec.isSkin, kw, marks: (info && info.marks) || {}, formatName: spec.formatName };
   }
 
   // For a SKIN, clear the site's OWN competing skin first (once) — otherwise the site's
@@ -1264,7 +1273,15 @@ function setupLive(httpServer) {
         const r = await injectAdnami(page, liveCreative, livePlacement);
         let m;
         if (r && r.ours) m = "Dit format er vist ✓";
-        else if (r && r.needsPlacement) m = "Ingen auto-match (format=\"" + (r.formatName || "?") + "\", nøgleord=\"" + (r.kw || "") + "\", fids på siden: [" + ((r.fids || []).join(", ") || "ingen") + "]). Tryk Vælg placering og klik der, hvor dit format skal ind.";
+        else if (r && r.needsPlacement) {
+          const mk = r.marks || {};
+          m = "Ingen auto-match. format=\"" + (r.formatName || "?") + "\" nøgleord=\"" + (r.kw || "") + "\"" +
+              " | fids:[" + ((mk.fids || []).join(", ") || "ingen") + "]" +
+              " | adsm-iframes:[" + ((mk.adsmIframes || []).join(", ") || "ingen") + "]" +
+              " | klasser:[" + ((mk.adnmClasses || []).join(", ") || "ingen") + "]" +
+              " | els:[" + ((mk.adnmEls || []).join(", ") || "ingen") + "]" +
+              ". Brug Vælg placering.";
+        }
         else if (r && r.mounted) m = "Adnami-format indsat ✓";
         else m = "Adnami-tag indsat, men formatet mountede ikke (tjek ID/format-type).";
         send({ t: "notice", msg: m });
