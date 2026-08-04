@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.35-skin-placement";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.36-skin-placement";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -520,26 +520,22 @@ async function loadPageAds(page) {
 // .adsm-sticky-wrapper whose wallpaper carries OUR creative code (that's our skin once
 // it builds) and the slot we injected into; everything else (the site's live skin) is
 // removed — and we keep removing for a few seconds in case the site rebuilds it.
+// Remove ONLY the SAME format that our creative is — i.e. for a skin preview, remove the
+// site's competing SKIN and put ours in its place. We deliberately leave every other
+// format (topscroll, midscroll, banners) untouched so the page still shows its live ads.
 async function clearSiteHighImpact(page, keepCc) {
   await page.evaluate((keep) => {
     const clear = () => {
       try {
-        // 1) Competing SKINS (wallpapers) that aren't ours.
+        // Only competing SKINS (wallpaper takeovers) that aren't ours. Topscroll / midscroll
+        // / banners are a different format and stay on the page.
         document.querySelectorAll(".adsm-sticky-wrapper").forEach((n) => {
           const wp = n.querySelector(".adsm-wallpaper[data-adnm-cc]");
           const cc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
           if (keep && cc && cc === keep) return;              // keep OUR skin
           if (n.querySelector("[data-cx-injected]")) return;  // keep the slot we injected into
-          n.remove();                                          // drop the site's competing skin
+          n.remove();                                          // drop the site's competing skin only
         });
-        // 2) ALL topscrolls — our preview is a skin, so every topscroll is the site's own
-        //    (3F Superliga, TUI-banner, etc.). Remove the frame + the reserved space.
-        document.querySelectorAll('.adnm-html-topscroll-frame-wrapper, [class*="topscroll-frame"], [class*="topscroll-expander"], [class*="adnm-topscroll"]').forEach((n) => {
-          if (n.querySelector && n.querySelector("[data-cx-injected]")) return;
-          n.remove();
-        });
-        const html = document.documentElement;
-        Array.from(html.classList).forEach((c) => { if (/^adnm-topscroll/i.test(c)) html.classList.remove(c); });
       } catch (e) {}
     };
     clear();
