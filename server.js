@@ -49,7 +49,7 @@ const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // 
 const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1280", 10);      // cap streamed frame width (page still renders at full viewport; 2560→1280 downsamples = sharp + far lighter to encode)
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "800", 10);       // cap streamed frame height
-const ENGINE_VERSION  = "2.51-lighter-stream";                                     // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.52-selective-proxy";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -94,9 +94,36 @@ function upstreamProxyUrl() {
     : "";
   return `${PROXY.server.replace("://", "://" + auth)}`;
 }
-let relayUrl = null; // local auth-less proxy URL once the relay is up
+let relayUrl = null;    // local proxy URL once the selective relay is up
+let relayServer = null; // the proxy-chain Server instance (selective routing)
+
+// SELECTIVE PROXY ROUTING — only ad-tech / RTB domains go through the Danish residential
+// proxy (they must see a DK IP so the ad auction fills the Danish high-impact formats).
+// Everything else — the site's own content, images, fonts, CDNs — goes DIRECT (fast).
+// The list matches the ad exchange + SSP + Adnami domains that carry the user's IP; add
+// more via PROXY_AD_DOMAINS (comma-separated) if a site uses an SSP we don't cover.
+const AD_PROXY_HOSTS = (process.env.PROXY_AD_DOMAINS ||
+  [
+    "adnami.io",                       // Adnami engine, macro, RTB (the high-impact formats)
+    "doubleclick.net", "g.doubleclick.net", "googlesyndication.com", "googletagservices.com",
+    "googleadservices.com", "adservice.google", "2mdn.net", "gstatic.com",   // Google ad stack (runs the auction)
+    "adnxs.com", "adform.net", "rubiconproject.com", "pubmatic.com", "openx.net",
+    "criteo.com", "criteo.net", "smartadserver.com", "sascdn.com", "casalemedia.com",
+    "3lift.com", "adsrvr.org", "id5-sync.com", "gumgum.com", "teads.tv", "yieldlab.net",
+    "improvedigital.com", "360yield.com", "sharethrough.com", "indexexchange.com",
+    "onetag.com", "sovrn.com", "lijit.com", "media.net", "amazon-adsystem.com",
+    "relevant-digital.com", "relevantdigital.com", "prebid", "rmbl.ws",
+    "ipinfo.io", "ip.decodo.com", "decodo.com",   // IP-echo hosts so /myip reflects the DK proxy path
+  ].join(",")
+).split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+function shouldProxyHost(hostname) {
+  const h = (hostname || "").toLowerCase();
+  return AD_PROXY_HOSTS.some((dom) => h === dom || h.endsWith("." + dom) || h.includes(dom));
+}
+
 const proxyInfo = () => PROXY
-  ? { enabled: true, server: PROXY.server, auth: !!PROXY.username, relay: !!relayUrl }
+  ? { enabled: true, server: PROXY.server, auth: !!PROXY.username, relay: !!relayUrl, selective: !!relayServer, adDomains: AD_PROXY_HOSTS.length }
   : { enabled: false };
 if (PROXY) console.log(`Proxy aktiv → ${PROXY.server}${PROXY.username ? " (login via lokal relay)" : ""}`);
 
@@ -114,13 +141,30 @@ async function getBrowser() {
     const upstream = upstreamProxyUrl();
     if (upstream) {
       try {
-        relayUrl = await ProxyChain.anonymizeProxy({ url: upstream, port: 0 });
-        launchProxy = { server: relayUrl }; // auth-less local URL → no per-request 407s
-        console.log("Proxy-relay klar (login håndteres lokalt) → " + relayUrl);
+        // Selective relay: per request, route ad-tech domains through the DK upstream and
+        // everything else DIRECT. Chromium points at this local server for ALL traffic.
+        const server = new ProxyChain.Server({
+          port: 0,
+          verbose: false,
+          prepareRequestFunction: ({ hostname }) => ({
+            upstreamProxyUrl: shouldProxyHost(hostname) ? upstream : null, // null = go direct
+          }),
+        });
+        await server.listen();
+        relayServer = server;
+        relayUrl = `http://127.0.0.1:${server.port}`;
+        launchProxy = { server: relayUrl };
+        console.log("Selektiv proxy-relay klar → " + relayUrl + " (annonce-domæner via DK, resten direkte)");
       } catch (e) {
-        // Fall back to letting Chromium handle the upstream login directly.
-        launchProxy = PROXY;
-        console.log("Proxy-relay kunne ikke starte, bruger direkte proxy-login: " + (e && e.message || e));
+        // Fall back to the simple all-through relay if the selective server can't start.
+        try {
+          relayUrl = await ProxyChain.anonymizeProxy({ url: upstream, port: 0 });
+          launchProxy = { server: relayUrl };
+          console.log("Selektiv relay fejlede, bruger gennemgående relay → " + relayUrl + " (" + (e && e.message || e) + ")");
+        } catch (e2) {
+          launchProxy = PROXY;
+          console.log("Proxy-relay kunne ikke starte, bruger direkte proxy-login: " + (e2 && e2.message || e2));
+        }
       }
     }
     browserPromise = chromium.launch({
@@ -1442,7 +1486,7 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {
     server.close();
     try { const b = await browserPromise; if (b) await b.close(); } catch {}
-    try { if (relayUrl) await ProxyChain.closeAnonymizedProxy(relayUrl, true); } catch {}
+    try { if (relayServer) await relayServer.close(true); else if (relayUrl) await ProxyChain.closeAnonymizedProxy(relayUrl, true); } catch {}
     process.exit(0);
   });
 }
