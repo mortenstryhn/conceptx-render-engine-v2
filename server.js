@@ -49,7 +49,7 @@ const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // 
 const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width (page still renders at full viewport)
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
-const ENGINE_VERSION  = "2.44-all-formats";                                        // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.46-autoreplace-any";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -394,6 +394,16 @@ function parseAdnamiSpec(text) {
   };
 }
 
+// Derive a generic format keyword from the creative's format name — used to find a RUNNING
+// ad of the SAME format on the page (matched against its data-adnm-fid) so we can auto-replace
+// it. Site-agnostic: it reads Adnami's own format id, never slot names.
+function formatKeyword(spec) {
+  const s = ((spec && spec.formatName) || "").toLowerCase().replace(/\s+/g, "");
+  const known = ["doublemidscroll", "midscroll", "topscroll", "interscroll", "understitial", "adnfilm", "skin", "wallpaper"];
+  for (const k of known) if (s.includes(k)) return k === "wallpaper" ? "skin" : (k === "doublemidscroll" ? "midscroll" : k);
+  return "";
+}
+
 // Non-destructive skin reveal: a skin paints a full-page background but the page's
 // own opaque background hides it in the margins. We make html/body transparent with
 // CSS only (NO node moving — that would trip the format's self-destruct watchdog),
@@ -576,28 +586,48 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   //    centre point of that running skin and reuse the proven placeAdnamiAt() flow.
   //  • If NO skin is running → do NOT auto-inject (injecting a skin at <body> is wrong and
   //    disturbs the page). Leave the real ads and let the user point the crosshair.
-  if (spec.isSkin && !placement) {
-    const pt = await page.evaluate((ourCc) => {
-      const wraps = Array.from(document.querySelectorAll(".adsm-sticky-wrapper"));
-      for (const wr of wraps) {
-        const wp = wr.querySelector(".adsm-wallpaper[data-adnm-cc]");
-        const cc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
-        const served = wr.querySelector('iframe[id^="adsm-iframe"], iframe[src]');
-        if (cc && cc !== ourCc && served) {
-          const r = wp.getBoundingClientRect();
-          const wl = wr.querySelector(".adsm-wallpaper-l"), wrr = wr.querySelector(".adsm-wallpaper-r");
-          let cx = Math.round(window.innerWidth / 2);
-          if (wl && wrr) { const a = wl.getBoundingClientRect(), b = wrr.getBoundingClientRect(); cx = Math.round((a.right + b.left) / 2); }
-          return { x: cx, y: Math.round(r.top + 20) };
+  if (!placement) {
+    // AUTO-REPLACE: find a RUNNING ad of the SAME format as our creative and swap it in place.
+    // Matched via Adnami's own format id (data-adnm-fid) — site-agnostic, no slot names.
+    const kw = formatKeyword(spec);
+    const pt = await page.evaluate(({ ourCc, kw, isSkin }) => {
+      // SKIN → use the running wallpaper (content-centre, top band of the skin position).
+      if (isSkin) {
+        const wraps = Array.from(document.querySelectorAll(".adsm-sticky-wrapper"));
+        for (const wr of wraps) {
+          const wp = wr.querySelector(".adsm-wallpaper[data-adnm-cc]");
+          const cc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
+          const served = wr.querySelector('iframe[id^="adsm-iframe"], iframe[src]');
+          if (cc && cc !== ourCc && served) {
+            const wl = wr.querySelector(".adsm-wallpaper-l"), wrr = wr.querySelector(".adsm-wallpaper-r");
+            let cx = Math.round(window.innerWidth / 2);
+            if (wl && wrr) { const a = wl.getBoundingClientRect(), b = wrr.getBoundingClientRect(); cx = Math.round((a.right + b.left) / 2); }
+            return { x: cx, y: Math.round(wp.getBoundingClientRect().top + 20) };
+          }
         }
+        return null;
+      }
+      // NON-SKIN → find a rendered ad whose format id contains our format keyword, scroll it
+      // into view, and return its centre (so elementFromPoint can resolve its slot).
+      if (!kw) return null;
+      for (const el of Array.from(document.querySelectorAll("[data-adnm-fid]"))) {
+        const fid = (el.getAttribute("data-adnm-fid") || "").toLowerCase();
+        const cc = (el.getAttribute("data-adnm-cc") || "").toLowerCase();
+        if (!fid.includes(kw) || cc === ourCc) continue;
+        let r = el.getBoundingClientRect();
+        if (r.width < 20 || r.height < 20) continue;
+        el.scrollIntoView({ block: "center" });
+        r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + Math.min(r.height / 2, 150)) };
       }
       return null;
-    }, (creativeCode || "").toLowerCase()).catch(() => null);
+    }, { ourCc: (creativeCode || "").toLowerCase(), kw, isSkin: !!spec.isSkin }).catch(() => null);
     if (pt) {
       const rr = await placeAdnamiAt(page, creativeCode, pt.x, pt.y, true); // warmed: skip 2nd ad-load
-      return { ok: true, mounted: !!(rr && rr.mounted), ours: !!(rr && rr.ours), auto: true, isSkin: true };
+      return { ok: true, mounted: !!(rr && rr.mounted), ours: !!(rr && rr.ours), auto: true, isSkin: !!spec.isSkin };
     }
-    return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: true };
+    // No matching running ad → show the real ads and let the user point the crosshair.
+    return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: !!spec.isSkin };
   }
 
   // For a SKIN, clear the site's OWN competing skin first (once) — otherwise the site's
@@ -814,7 +844,8 @@ async function placeAdnamiAt(page, creativeCode, x, y, warmed) {
     }, creativeCode).catch(() => diag);
     if (diag.ours) break;
   }
-  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  // Only a skin needs the viewport at the very top; in-content formats stay where placed.
+  if (spec.isSkin) await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
   return { ok: true, mounted: diag.ours || diag.present, ours: diag.ours, present: diag.present, selector, isSkin: !!spec.isSkin, usedHost: result && result.usedHost, injected: result };
 }
 
@@ -1211,7 +1242,7 @@ function setupLive(httpServer) {
         const r = await injectAdnami(page, liveCreative, livePlacement);
         let m;
         if (r && r.ours) m = "Dit format er vist ✓";
-        else if (r && r.needsPlacement) m = "Siden vises med de rigtige annoncer. Tryk Vælg placering og klik på annoncen, hvor dit skin skal ind.";
+        else if (r && r.needsPlacement) m = "Siden vises med de rigtige annoncer. Tryk Vælg placering og klik der, hvor dit format skal ind.";
         else if (r && r.mounted) m = "Adnami-format indsat ✓";
         else m = "Adnami-tag indsat, men formatet mountede ikke (tjek ID/format-type).";
         send({ t: "notice", msg: m });
