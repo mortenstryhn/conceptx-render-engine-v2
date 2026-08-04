@@ -50,7 +50,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "2", 10);// SMOOTHNESS lever on big viewports: send every Nth frame (higher = lighter CPU, choppier motion; sharpness unaffected)
-const ENGINE_VERSION  = "2.53-sharper";                                            // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.54-adaptive";                                           // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1305,6 +1305,8 @@ function setupLive(httpServer) {
     let context = null, page = null, cdp = null, closed = false, started = false;
     let idleTimer = null;
     let manualConsent = false;
+    let motionTimer = null;            // adaptive stream: revert-to-sharp timer
+    let enterMotion = () => {};        // set up once the screencast is running
     let liveCreative = "", livePlacement = ""; // Adnami creative kept for re-injection after nav/reload
     let liveUrl = ""; // last good URL, so "reload" recovers even from a chrome-error tab
     let q = Promise.resolve(); // serialises input events so they apply in order
@@ -1340,6 +1342,7 @@ function setupLive(httpServer) {
     const cleanup = async () => {
       if (closed) return; closed = true;
       if (idleTimer) clearTimeout(idleTimer);
+      if (motionTimer) clearTimeout(motionTimer);
       liveCount = Math.max(0, liveCount - 1);
       try { if (cdp) await cdp.detach(); } catch {}
       try { if (context) await context.close(); } catch {}
@@ -1408,10 +1411,26 @@ function setupLive(httpServer) {
           // lever on large desktop viewports — fewer pixels to encode+send per frame.
           const streamMaxW = Math.min(vw, LIVE_MAX_W);
           const streamMaxH = Math.min(vh, LIVE_MAX_H);
-          // On big desktop viewports, capture every 2nd frame — halves encode CPU so the
-          // stream stays smooth under memory/CPU pressure (fresh frames, no growing backlog).
-          const streamEveryNth = (vw * vh > 1600 * 1000) ? Math.max(1, LIVE_EVERYNTH_BIG) : 1;
-          await cdp.send("Page.startScreencast", { format: "jpeg", quality: liveQ, everyNthFrame: streamEveryNth, maxWidth: streamMaxW, maxHeight: streamMaxH });
+          const bigViewport = vw * vh > 1600 * 1000;
+          // ADAPTIVE QUALITY — the key to "sharp AND smooth": stream SHARP (full res, every
+          // frame) when the page is still (what you look at), and drop to a lighter MOTION
+          // profile only WHILE actively scrolling/interacting, then snap back to sharp the
+          // moment you stop. So stills are crisp and motion stays fluid on limited CPU.
+          const sharpParams  = { format: "jpeg", quality: liveQ, everyNthFrame: 1, maxWidth: streamMaxW, maxHeight: streamMaxH };
+          const motionParams = { format: "jpeg", quality: Math.min(liveQ, 55), everyNthFrame: Math.max(2, LIVE_EVERYNTH_BIG), maxWidth: Math.min(streamMaxW, 1280), maxHeight: Math.min(streamMaxH, 800) };
+          await cdp.send("Page.startScreencast", sharpParams);
+          if (bigViewport) {
+            let inMotion = false;
+            const applyStream = async (motion) => {
+              try { await cdp.send("Page.stopScreencast"); } catch (e) {}
+              try { await cdp.send("Page.startScreencast", motion ? motionParams : sharpParams); } catch (e) {}
+            };
+            enterMotion = () => {
+              if (!inMotion) { inMotion = true; applyStream(true); }        // going to motion → lighter
+              if (motionTimer) clearTimeout(motionTimer);
+              motionTimer = setTimeout(() => { inMotion = false; applyStream(false); }, 650); // idle → snap back to sharp
+            };
+          }
           send({ t: "ready", w: vw, h: vh, url });
 
           // Remember the creative for this session (validated) so we can re-inject after navigations.
@@ -1428,6 +1447,8 @@ function setupLive(httpServer) {
         }
         else if (!page) { return; }
         else {
+          // Any active input → briefly enter the lighter MOTION stream (adaptive quality).
+          if (msg.t === "mouse" || msg.t === "wheel" || msg.t === "key") enterMotion();
           // Serialise all input so events (down→up, move→click) never reorder.
           q = q.then(async () => {
             if (msg.t === "mouse") {
