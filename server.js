@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.38-live-diag";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.40-live-autoskin";                                      // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -524,25 +524,19 @@ async function loadPageAds(page) {
 // site's competing SKIN and put ours in its place. We deliberately leave every other
 // format (topscroll, midscroll, banners) untouched so the page still shows its live ads.
 async function clearSiteHighImpact(page, keepCc) {
+  // Remove the competing SKIN ONCE. A repeating interval re-triggers Adnami's own
+  // teardown (it rebuilds, we rip out, it tears everything down) — which wipes ALL
+  // formats incl. topscroll/banners. The proven local recipe removes it a single time.
   await page.evaluate((keep) => {
-    const clear = () => {
-      try {
-        // Only competing SKINS (wallpaper takeovers) that aren't ours. Topscroll / midscroll
-        // / banners are a different format and stay on the page.
-        document.querySelectorAll(".adsm-sticky-wrapper").forEach((n) => {
-          const wp = n.querySelector(".adsm-wallpaper[data-adnm-cc]");
-          const cc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
-          if (keep && cc && cc === keep) return;              // keep OUR skin
-          if (n.querySelector("[data-cx-injected]")) return;  // keep the slot we injected into
-          n.remove();                                          // drop the site's competing skin only
-        });
-      } catch (e) {}
-    };
-    clear();
-    if (!window.__cxClearInt) {
-      window.__cxClearInt = setInterval(clear, 400);
-      setTimeout(() => { try { clearInterval(window.__cxClearInt); window.__cxClearInt = null; } catch (e) {} }, 12000);
-    }
+    try {
+      document.querySelectorAll(".adsm-sticky-wrapper").forEach((n) => {
+        const wp = n.querySelector(".adsm-wallpaper[data-adnm-cc]");
+        const cc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
+        if (keep && cc && cc === keep) return;              // keep OUR skin
+        if (n.querySelector("[data-cx-injected]")) return;  // keep the slot we injected into
+        n.remove();                                          // drop the site's competing skin only
+      });
+    } catch (e) {}
   }, (keepCc || "").toLowerCase()).catch(() => {});
 }
 
@@ -568,9 +562,39 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   // Ensure the engine context exists (lite macro), like the extension's loadAdsv2().
   // Self-skips when the site's own engine is already up, so it's safe/no-op there.
   await loadAdnamiContext(page);
-  // For a SKIN, clear the site's OWN skin/topscroll takeover first (the extension's
-  // settingOverrideAdnamiFormats) — otherwise the site's live campaign keeps the skin
-  // slot and OUR creative never becomes the page takeover.
+
+  // LIVE tool: "Vis format" for a SKIN with NO chosen placement.
+  //  • If the site is ALREADY running a (foreign) skin → auto-replace it in its own slot
+  //    (the user's rule: an existing skin gets replaced automatically). We compute the top-
+  //    centre point of that running skin and reuse the proven placeAdnamiAt() flow.
+  //  • If NO skin is running → do NOT auto-inject (injecting a skin at <body> is wrong and
+  //    disturbs the page). Leave the real ads and let the user point the crosshair.
+  if (spec.isSkin && !placement) {
+    const pt = await page.evaluate((ourCc) => {
+      const wraps = Array.from(document.querySelectorAll(".adsm-sticky-wrapper"));
+      for (const wr of wraps) {
+        const wp = wr.querySelector(".adsm-wallpaper[data-adnm-cc]");
+        const cc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
+        const served = wr.querySelector('iframe[id^="adsm-iframe"], iframe[src]');
+        if (cc && cc !== ourCc && served) {
+          const r = wp.getBoundingClientRect();
+          const wl = wr.querySelector(".adsm-wallpaper-l"), wrr = wr.querySelector(".adsm-wallpaper-r");
+          let cx = Math.round(window.innerWidth / 2);
+          if (wl && wrr) { const a = wl.getBoundingClientRect(), b = wrr.getBoundingClientRect(); cx = Math.round((a.right + b.left) / 2); }
+          return { x: cx, y: Math.round(r.top + 20) };
+        }
+      }
+      return null;
+    }, (creativeCode || "").toLowerCase()).catch(() => null);
+    if (pt) {
+      const rr = await placeAdnamiAt(page, creativeCode, pt.x, pt.y);
+      return { ok: true, mounted: !!(rr && rr.mounted), ours: !!(rr && rr.ours), auto: true, isSkin: true };
+    }
+    return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: true };
+  }
+
+  // For a SKIN, clear the site's OWN competing skin first (once) — otherwise the site's
+  // live campaign keeps the skin slot and OUR creative never becomes the page takeover.
   if (spec.isSkin) await clearSiteHighImpact(page, creativeCode);
   let result = null, method = "";
 
@@ -1143,9 +1167,12 @@ function setupLive(httpServer) {
       send({ t: "notice", msg: "Indsætter Adnami-format…" });
       try {
         const r = await injectAdnami(page, liveCreative, livePlacement);
-        send({ t: "notice", msg: (r && r.mounted)
-          ? "Adnami-format indsat ✓"
-          : "Adnami-tag indsat, men formatet mountede ikke (tjek ID/format-type)." });
+        let m;
+        if (r && r.ours) m = "Dit skin er placeret ✓";
+        else if (r && r.needsPlacement) m = "Siden vises med de rigtige annoncer. Tryk Vælg placering og klik på annoncen, hvor dit skin skal ind.";
+        else if (r && r.mounted) m = "Adnami-format indsat ✓";
+        else m = "Adnami-tag indsat, men formatet mountede ikke (tjek ID/format-type).";
+        send({ t: "notice", msg: m });
       }
       catch (e) { send({ t: "notice", msg: "Adnami: " + String(e.message || e) }); }
     };
