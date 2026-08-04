@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.36-skin-placement";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.37-skin-slot-generic";                                 // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -579,12 +579,17 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   // placement) and write our preview <ins> + engine into it. Proven locally: injecting into
   // the real SKIN placement makes the engine build the full seamless skin in full viewport
   // width with wings in the margins. Injecting at <body> or a topscroll slot does NOT.
-  result = await page.evaluate(({ creativeCode, spec, engineSrc, placement }) => {
+  result = await page.evaluate(({ creativeCode, spec, engineSrc, placement, isSkin }) => {
     try {
       document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+      if (isSkin) {
+        const html = document.documentElement;
+        Array.from(html.classList).forEach((k) => { if (/^adsm-skin/i.test(k)) html.classList.remove(k); });
+      }
       let host = null;
       if (placement) { try { host = document.querySelector(placement); } catch (e) { host = null; } }
       if (!host) host = document.body;
+      if (isSkin && host !== document.body) host.querySelectorAll("iframe, div[id^='google_ads_iframe']").forEach((k) => k.remove());
       const ifr = document.createElement("iframe");
       ifr.width = "0"; ifr.height = "0";
       ifr.style.cssText = "width:0;height:0;border:0;";
@@ -610,7 +615,7 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
       d.body.appendChild(holder);
       return { ok: true, usedHost: host.id || host.tagName };
     } catch (e) { return { ok: false, reason: String(e && e.message || e) }; }
-  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "" });
+  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "", isSkin: !!spec.isSkin });
   method = "auto-iframe";
 
   // FALLBACK — if the hidden-iframe write failed, inject a plain top-level ins.
@@ -648,34 +653,36 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
 // never shows in two places, we capture a selector for the clicked slot, RELOAD the
 // page (wiping the previous render completely), then inject ONCE — replacing that slot.
 async function placeAdnamiAt(page, creativeCode, x, y) {
-  // 1) Capture a stable selector for the clicked slot before touching anything.
+  // 1) From the clicked point, resolve the SITE'S OWN slot div (proven local recipe):
+  //    walk up from elementFromPoint and SKIP the cross-origin ad iframe AND Google's own
+  //    GPT container (id^="google_ads_iframe" — Google's universal naming, not site-specific,
+  //    and unstable to write into). The first id'd, content-width (600–1200px) ancestor is
+  //    the site's real leaderboard/skin slot (e.g. #cncpt-lb1). No slot-name guessing.
   const selector = await page.evaluate(({ x, y }) => {
-    function cssPath(el) {
-      const parts = [];
-      while (el && el.nodeType === 1 && el !== document.body && el !== document.documentElement && parts.length < 7) {
-        if (el.id) { parts.unshift("#" + CSS.escape(el.id)); return parts.join(" > "); }
-        let sel = el.tagName.toLowerCase();
-        const parent = el.parentElement;
-        if (parent) {
-          const sibs = Array.from(parent.children).filter((c) => c.tagName === el.tagName);
-          if (sibs.length > 1) sel += ":nth-of-type(" + (sibs.indexOf(el) + 1) + ")";
-        }
-        parts.unshift(sel);
-        el = el.parentElement;
+    function stableSelector(host) {
+      if (host.id) return "#" + CSS.escape(host.id);
+      const parts = []; let e = host;
+      while (e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && parts.length < 7) {
+        if (e.id) { parts.unshift("#" + CSS.escape(e.id)); break; }
+        let sel = e.tagName.toLowerCase();
+        const p = e.parentElement;
+        if (p) { const sibs = Array.from(p.children).filter((c) => c.tagName === e.tagName); if (sibs.length > 1) sel += ":nth-of-type(" + (sibs.indexOf(e) + 1) + ")"; }
+        parts.unshift(sel); e = e.parentElement;
       }
       return parts.join(" > ");
     }
-    let node = document.elementFromPoint(x, y);
-    if (!node || node === document.documentElement) node = document.body;
-    let slot = node, guard = 0;
-    while (slot.parentElement && slot.parentElement !== document.body &&
-           slot.parentElement !== document.documentElement && guard++ < 8) {
-      const ps = slot.parentElement.getBoundingClientRect();
-      const ss = slot.getBoundingClientRect();
-      if (ps.height > ss.height * 1.6 + 60) break; // parent is a big container → stop
-      slot = slot.parentElement;
+    let el = document.elementFromPoint(x, y);
+    if (!el || el === document.documentElement) el = document.body;
+    let host = null, n = el;
+    while (n && n !== document.body && n.nodeType === 1) {
+      const rw = Math.round(n.getBoundingClientRect().width);
+      const isCrossFrame = n.tagName === "IFRAME";
+      const isGpt = n.id && /^google_ads_iframe/i.test(n.id);
+      if (!host && n.id && !isCrossFrame && !isGpt && rw >= 600 && rw <= 1200) { host = n; break; }
+      n = n.parentElement;
     }
-    return slot === document.body ? "" : cssPath(slot);
+    if (!host) { let m = el; while (m && m.tagName === "IFRAME") m = m.parentElement; host = m || document.body; }
+    return host === document.body ? "" : stableSelector(host);
   }, { x: Math.round(x), y: Math.round(y) });
 
   // 2) Fetch spec + warm up the page's Adnami engine. No reload — keep the loaded page.
@@ -683,16 +690,25 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
   await loadPageAds(page).catch(() => {});
   await loadAdnamiContext(page);
+  // Remove ONLY a competing SKIN — topscroll / midscroll / other ads stay untouched.
   if (spec.isSkin) await clearSiteHighImpact(page, creativeCode);
 
-  // 3) Inject a hidden same-origin iframe INTO the clicked placement (the proven method):
-  //    for a skin placement the engine then builds the full-width seamless skin with wings.
-  const result = await page.evaluate(({ creativeCode, spec, engineSrc, selector }) => {
+  // 3) Inject a hidden 0×0 same-origin iframe INTO the site's own slot (the proven method).
+  //    For a SKIN we first strip only the OLD skin's html classes (keep topscroll classes so
+  //    its offset is preserved and the slot stays at the right position UNDER the topscroll)
+  //    and empty the slot's old ad content — so our skin builds from the slot's top.
+  const result = await page.evaluate(({ creativeCode, spec, engineSrc, selector, isSkin }) => {
     try {
       document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+      if (isSkin) {
+        const html = document.documentElement;
+        Array.from(html.classList).forEach((k) => { if (/^adsm-skin/i.test(k)) html.classList.remove(k); });
+      }
       let host = null;
       if (selector) { try { host = document.querySelector(selector); } catch (e) { host = null; } }
       if (!host) host = document.body;
+      // Empty ONLY the target skin slot of its old ad content before building.
+      if (isSkin && host !== document.body) host.querySelectorAll("iframe, div[id^='google_ads_iframe']").forEach((k) => k.remove());
       const ifr = document.createElement("iframe");
       ifr.width = "0"; ifr.height = "0"; ifr.style.cssText = "width:0;height:0;border:0;";
       ifr.setAttribute("data-cx-injected", "");
@@ -716,7 +732,7 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
       d.body.appendChild(holder);
       return { ok: true, usedHost: host.id || host.tagName };
     } catch (e) { return { ok: false, reason: String(e && e.message || e) }; }
-  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, selector });
+  }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, selector, isSkin: !!spec.isSkin });
 
   // 4) Let the format take over, then scroll to top so the skin shows from the top.
   await page.waitForTimeout(8000);
