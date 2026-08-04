@@ -49,7 +49,7 @@ const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // 
 const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width (page still renders at full viewport)
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
-const ENGINE_VERSION  = "2.42-quality-speed";                                      // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.43-fast-mount";                                         // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -499,6 +499,9 @@ function adnamiPreviewSrc(creativeCode, type, w, h, ts) {
 // for a real slot iframe (id "adsm-iframe-…") to appear. These are the "green boxes"
 // the extension lets you click. Returns true if at least one real slot exists.
 async function loadPageAds(page) {
+  // Fast path: if the page already has a real Adnami slot, don't scroll at all.
+  const already = await page.evaluate(() => !!document.querySelector('iframe[id^="adsm-iframe"]')).catch(() => false);
+  if (already) return true;
   // Dwelling scroll so the ad auction runs and lazy Adnami slots fill — but stop AS SOON as
   // a real slot appears (don't keep scrolling for the full timeout). Faster load, same result.
   await page.evaluate(async () => {
@@ -669,11 +672,15 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
 
   if (!result || !result.ok) throw new Error("Kunne ikke forankre Adnami-preview på siden" + (fetchNote ? (" (" + fetchNote + ")") : ""));
 
-  // Let the format take over — do NOT touch the DOM.
-  await page.waitForTimeout(8000);
-  const mounted = await page.evaluate(
-    () => !!document.querySelector('.adsm-sticky-wrapper, [class*="adsm-wallpaper"], [data-adnm-fid]')
-  ).catch(() => false);
+  // Poll (max ~7s) — return AS SOON AS the format mounts, instead of a fixed wait.
+  let mounted = false;
+  for (let i = 0; i < 14; i++) {
+    await page.waitForTimeout(500);
+    mounted = await page.evaluate(
+      () => !!document.querySelector('.adsm-sticky-wrapper, [class*="adsm-wallpaper"], [data-adnm-fid]')
+    ).catch(() => false);
+    if (mounted) break;
+  }
   return { ok: true, mounted, method, hasSlot, fetchNote, isSkin: spec.isSkin };
 }
 
@@ -766,17 +773,17 @@ async function placeAdnamiAt(page, creativeCode, x, y, warmed) {
     } catch (e) { return { ok: false, reason: String(e && e.message || e) }; }
   }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, selector, isSkin: !!spec.isSkin });
 
-  // 4) Let the format take over, then scroll to top so the skin shows from the top.
-  await page.waitForTimeout(8000);
-  const diag = await page.evaluate((cc) => {
-    const wp = document.querySelector(".adsm-wallpaper[data-adnm-cc]");
-    const wpCc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
-    return {
-      ours: !!(wpCc && wpCc === (cc || "").toLowerCase()),
-      anySkin: !!document.querySelector('.adsm-sticky-wrapper, [data-adnm-fid]'),
-      wpCc,
-    };
-  }, creativeCode).catch(() => ({ ours: false, anySkin: false, wpCc: "" }));
+  // 4) Poll (max ~7s) — return AS SOON AS our skin mounts, instead of a fixed wait.
+  let diag = { ours: false, anySkin: false, wpCc: "" };
+  for (let i = 0; i < 14; i++) {
+    await page.waitForTimeout(500);
+    diag = await page.evaluate((cc) => {
+      const wp = document.querySelector(".adsm-wallpaper[data-adnm-cc]");
+      const wpCc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
+      return { ours: !!(wpCc && wpCc === (cc || "").toLowerCase()), anySkin: !!document.querySelector('.adsm-sticky-wrapper, [data-adnm-fid]'), wpCc };
+    }, creativeCode).catch(() => diag);
+    if (diag.ours) break;
+  }
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
   return { ok: true, mounted: diag.ours || diag.anySkin, ours: diag.ours, wpCc: diag.wpCc, selector, isSkin: !!spec.isSkin, usedHost: result && result.usedHost, injected: result };
 }
