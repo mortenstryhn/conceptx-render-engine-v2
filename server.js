@@ -653,16 +653,16 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
 // never shows in two places, we capture a selector for the clicked slot, RELOAD the
 // page (wiping the previous render completely), then inject ONCE — replacing that slot.
 async function placeAdnamiAt(page, creativeCode, x, y) {
-  // 1) From the clicked point, resolve the SITE'S OWN slot div (proven local recipe):
-  //    walk up from elementFromPoint and SKIP the cross-origin ad iframe AND Google's own
-  //    GPT container (id^="google_ads_iframe" — Google's universal naming, not site-specific,
-  //    and unstable to write into). The first id'd, content-width (600–1200px) ancestor is
-  //    the site's real leaderboard/skin slot (e.g. #cncpt-lb1). No slot-name guessing.
+  // 1) From the clicked point, resolve the SITE'S OWN slot — fully site-agnostic (no id or
+  //    slot-name assumptions, works with or without Google GPT). Universal principle: an ad
+  //    always sits in an IFRAME (or a GPT container "google_ads_iframe…", Google's universal
+  //    naming), and that node is placed inside the site's own slot element. So the site slot
+  //    is the PARENT of the HIGHEST ad node (iframe/GPT container) above the click.
   const selector = await page.evaluate(({ x, y }) => {
     function stableSelector(host) {
       if (host.id) return "#" + CSS.escape(host.id);
       const parts = []; let e = host;
-      while (e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && parts.length < 7) {
+      while (e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && parts.length < 8) {
         if (e.id) { parts.unshift("#" + CSS.escape(e.id)); break; }
         let sel = e.tagName.toLowerCase();
         const p = e.parentElement;
@@ -672,17 +672,20 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
       return parts.join(" > ");
     }
     let el = document.elementFromPoint(x, y);
-    if (!el || el === document.documentElement) el = document.body;
-    let host = null, n = el;
-    while (n && n !== document.body && n.nodeType === 1) {
-      const rw = Math.round(n.getBoundingClientRect().width);
+    if (!el || el === document.documentElement || el === document.body) return "";
+    // Find the highest ad node (cross-origin iframe OR GPT container) on the ancestor path.
+    let highestAd = (el.tagName === "IFRAME") ? el : null;
+    let n = el, guard = 0;
+    while (n && n !== document.body && n.nodeType === 1 && guard++ < 12) {
       const isCrossFrame = n.tagName === "IFRAME";
       const isGpt = n.id && /^google_ads_iframe/i.test(n.id);
-      if (!host && n.id && !isCrossFrame && !isGpt && rw >= 600 && rw <= 1200) { host = n; break; }
+      if (isCrossFrame || isGpt) highestAd = n;
       n = n.parentElement;
     }
-    if (!host) { let m = el; while (m && m.tagName === "IFRAME") m = m.parentElement; host = m || document.body; }
-    return host === document.body ? "" : stableSelector(host);
+    // Site slot = parent of the highest ad node; if no ad node, use the clicked element.
+    let host = highestAd ? highestAd.parentElement : el;
+    if (!host || host === document.body || host === document.documentElement) return "";
+    return stableSelector(host);
   }, { x: Math.round(x), y: Math.round(y) });
 
   // 2) Fetch spec + warm up the page's Adnami engine. No reload — keep the loaded page.
