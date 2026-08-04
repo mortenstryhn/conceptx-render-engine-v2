@@ -45,10 +45,11 @@ const BLOCK_MEDIA     = (process.env.BLOCK_MEDIA || "true") === "true";      // 
 const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // concurrent live/interactive sessions (each holds a browser tab open)
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
-const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1600", 10);      // cap streamed frame width (page still renders at full viewport)
-const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1000", 10);      // cap streamed frame height
-const ENGINE_VERSION  = "2.41-live-perf";                                          // bump when deploying; visible at /health
+const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // JPEG quality of streamed frames (higher = sharper)
+const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
+const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width (page still renders at full viewport)
+const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
+const ENGINE_VERSION  = "2.42-quality-speed";                                      // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -498,22 +499,23 @@ function adnamiPreviewSrc(creativeCode, type, w, h, ts) {
 // for a real slot iframe (id "adsm-iframe-…") to appear. These are the "green boxes"
 // the extension lets you click. Returns true if at least one real slot exists.
 async function loadPageAds(page) {
-  // Slow, dwelling scroll so the ad auction runs and lazy Adnami slots fill.
+  // Dwelling scroll so the ad auction runs and lazy Adnami slots fill — but stop AS SOON as
+  // a real slot appears (don't keep scrolling for the full timeout). Faster load, same result.
   await page.evaluate(async () => {
     await new Promise((res) => {
-      let y = 0, ticks = 0; const step = 500;
+      let y = 0, ticks = 0; const step = 600;
       const t = setInterval(() => {
         window.scrollBy(0, step); y += step; ticks++;
-        if (document.querySelector('iframe[id^="adsm-iframe"]') && ticks > 6) { clearInterval(t); res(); return; }
-        if (y >= document.body.scrollHeight - window.innerHeight || ticks > 60) { clearInterval(t); res(); }
-      }, 300);
-      setTimeout(() => { clearInterval(t); res(); }, 16000);
+        if (document.querySelector('iframe[id^="adsm-iframe"]') && ticks > 3) { clearInterval(t); res(); return; }
+        if (y >= document.body.scrollHeight - window.innerHeight || ticks > 40) { clearInterval(t); res(); }
+      }, 250);
+      setTimeout(() => { clearInterval(t); res(); }, 9000);
     });
     window.scrollTo(0, 0);
   }).catch(() => {});
   return await page.waitForFunction(
     () => !!document.querySelector('iframe[id^="adsm-iframe"]'),
-    { timeout: 12000 }
+    { timeout: 8000 }
   ).then(() => true).catch(() => false);
 }
 
@@ -589,7 +591,7 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
       return null;
     }, (creativeCode || "").toLowerCase()).catch(() => null);
     if (pt) {
-      const rr = await placeAdnamiAt(page, creativeCode, pt.x, pt.y);
+      const rr = await placeAdnamiAt(page, creativeCode, pt.x, pt.y, true); // warmed: skip 2nd ad-load
       return { ok: true, mounted: !!(rr && rr.mounted), ours: !!(rr && rr.ours), auto: true, isSkin: true };
     }
     return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: true };
@@ -678,7 +680,7 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
 // Re-place the creative at a clicked point (device CSS px). To guarantee the ad
 // never shows in two places, we capture a selector for the clicked slot, RELOAD the
 // page (wiping the previous render completely), then inject ONCE — replacing that slot.
-async function placeAdnamiAt(page, creativeCode, x, y) {
+async function placeAdnamiAt(page, creativeCode, x, y, warmed) {
   // 1) From the clicked point, resolve the SITE'S OWN slot — fully site-agnostic (no id or
   //    slot-name assumptions, works with or without Google GPT). Universal principle: an ad
   //    always sits in an IFRAME (or a GPT container "google_ads_iframe…", Google's universal
@@ -715,10 +717,11 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
   }, { x: Math.round(x), y: Math.round(y) });
 
   // 2) Fetch spec + warm up the page's Adnami engine. No reload — keep the loaded page.
+  //    `warmed` = the caller already ran loadPageAds/loadAdnamiContext (skip the slow
+  //    scroll+wait again — this is the big latency saver in the auto-skin flow).
   let spec = { width: 300, height: 240, type: "" };
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
-  await loadPageAds(page).catch(() => {});
-  await loadAdnamiContext(page);
+  if (!warmed) { await loadPageAds(page).catch(() => {}); await loadAdnamiContext(page); }
   // Remove ONLY a competing SKIN — topscroll / midscroll / other ads stay untouched.
   if (spec.isSkin) await clearSiteHighImpact(page, creativeCode);
 
@@ -1206,7 +1209,7 @@ function setupLive(httpServer) {
           manualConsent = msg.consent === "manual";
           // Per-session quality/sharpness (client can trade smoothness ↔ sharpness).
           let liveDsf   = Math.max(1, Math.min(2, Number(msg.dsf) || LIVE_DSF));
-          const liveQ   = Math.max(20, Math.min(90, Number(msg.quality) || LIVE_QUALITY));
+          const liveQ   = Math.max(LIVE_QUALITY_MIN, Math.min(90, Number(msg.quality) || LIVE_QUALITY));
           // Big desktop viewports (e.g. 2560×1440) are heavy to encode+stream. Drop the
           // extra supersampling there so playback stays smooth (layout is unaffected).
           if (vw * vh > 1600 * 1000) liveDsf = 1;
@@ -1261,7 +1264,14 @@ function setupLive(httpServer) {
             catch (e) { liveCreative = ""; send({ t: "notice", msg: e.message }); }
           }
 
-          await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => {});
+          // Navigate with one retry — a single proxy hiccup otherwise leaves the tab on
+          // chrome-error://chromewebdata/. Retry once before giving up.
+          let navOk = false;
+          for (let attempt = 0; attempt < 2 && !navOk; attempt++) {
+            try { await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }); navOk = true; }
+            catch (e) { if (attempt === 0) { send({ t: "status", msg: "Prøver igen…" }); await page.waitForTimeout(700); } }
+          }
+          if (!navOk) send({ t: "notice", msg: "Siden var langsom at hente (proxy). Tryk genindlæs hvis den ikke kom frem." });
           if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); }
           await doInject();
         }
