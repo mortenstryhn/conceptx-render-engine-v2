@@ -47,9 +47,10 @@ const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // 
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // JPEG quality of streamed frames (higher = sharper)
 const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
-const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1280", 10);      // cap streamed frame width (page still renders at full viewport; 2560→1280 downsamples = sharp + far lighter to encode)
-const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "800", 10);       // cap streamed frame height
-const ENGINE_VERSION  = "2.52-selective-proxy";                                    // bump when deploying; visible at /health
+const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
+const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
+const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "2", 10);// SMOOTHNESS lever on big viewports: send every Nth frame (higher = lighter CPU, choppier motion; sharpness unaffected)
+const ENGINE_VERSION  = "2.53-sharper";                                            // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1409,7 +1410,7 @@ function setupLive(httpServer) {
           const streamMaxH = Math.min(vh, LIVE_MAX_H);
           // On big desktop viewports, capture every 2nd frame — halves encode CPU so the
           // stream stays smooth under memory/CPU pressure (fresh frames, no growing backlog).
-          const streamEveryNth = (vw * vh > 1600 * 1000) ? 2 : 1;
+          const streamEveryNth = (vw * vh > 1600 * 1000) ? Math.max(1, LIVE_EVERYNTH_BIG) : 1;
           await cdp.send("Page.startScreencast", { format: "jpeg", quality: liveQ, everyNthFrame: streamEveryNth, maxWidth: streamMaxW, maxHeight: streamMaxH });
           send({ t: "ready", w: vw, h: vh, url });
 
