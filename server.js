@@ -46,7 +46,9 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.40-live-autoskin";                                      // bump when deploying; visible at /health
+const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1600", 10);      // cap streamed frame width (page still renders at full viewport)
+const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1000", 10);      // cap streamed frame height
+const ENGINE_VERSION  = "2.41-live-perf";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1203,8 +1205,11 @@ function setupLive(httpServer) {
 
           manualConsent = msg.consent === "manual";
           // Per-session quality/sharpness (client can trade smoothness ↔ sharpness).
-          const liveDsf = Math.max(1, Math.min(2, Number(msg.dsf) || LIVE_DSF));
+          let liveDsf   = Math.max(1, Math.min(2, Number(msg.dsf) || LIVE_DSF));
           const liveQ   = Math.max(20, Math.min(90, Number(msg.quality) || LIVE_QUALITY));
+          // Big desktop viewports (e.g. 2560×1440) are heavy to encode+stream. Drop the
+          // extra supersampling there so playback stays smooth (layout is unaffected).
+          if (vw * vh > 1600 * 1000) liveDsf = 1;
 
           let url;
           try { url = await assertSafeUrl(msg.url); }
@@ -1242,9 +1247,12 @@ function setupLive(httpServer) {
             try { if (ws.readyState === 1 && ws.bufferedAmount < 800000) ws.send(Buffer.from(f.data, "base64")); } catch {}
             try { await cdp.send("Page.screencastFrameAck", { sessionId: f.sessionId }); } catch {}
           });
-          // NOTE: screencast frames are always the device CSS width; dsf>1 renders the
-          // page at higher density and downscales (supersampling) → crisper text/edges.
-          await cdp.send("Page.startScreencast", { format: "jpeg", quality: liveQ, everyNthFrame: 1 });
+          // Cap the STREAMED frame size (page still renders at full viewport for correct
+          // layout; only the transmitted image is downscaled). This is the big smoothness
+          // lever on large desktop viewports — fewer pixels to encode+send per frame.
+          const streamMaxW = Math.min(vw, LIVE_MAX_W);
+          const streamMaxH = Math.min(vh, LIVE_MAX_H);
+          await cdp.send("Page.startScreencast", { format: "jpeg", quality: liveQ, everyNthFrame: 1, maxWidth: streamMaxW, maxHeight: streamMaxH });
           send({ t: "ready", w: vw, h: vh, url });
 
           // Remember the creative for this session (validated) so we can re-inject after navigations.
