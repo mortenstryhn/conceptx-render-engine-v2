@@ -46,7 +46,7 @@ const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // 
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
 const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "40", 10);      // JPEG quality of streamed frames (lower = smoother)
-const ENGINE_VERSION  = "2.37-skin-slot-generic";                                 // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.38-live-diag";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -739,11 +739,17 @@ async function placeAdnamiAt(page, creativeCode, x, y) {
 
   // 4) Let the format take over, then scroll to top so the skin shows from the top.
   await page.waitForTimeout(8000);
-  const mounted = await page.evaluate(
-    () => !!document.querySelector('.adsm-sticky-wrapper, [class*="adsm-wallpaper"], [data-adnm-fid]')
-  ).catch(() => false);
+  const diag = await page.evaluate((cc) => {
+    const wp = document.querySelector(".adsm-wallpaper[data-adnm-cc]");
+    const wpCc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
+    return {
+      ours: !!(wpCc && wpCc === (cc || "").toLowerCase()),
+      anySkin: !!document.querySelector('.adsm-sticky-wrapper, [data-adnm-fid]'),
+      wpCc,
+    };
+  }, creativeCode).catch(() => ({ ours: false, anySkin: false, wpCc: "" }));
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
-  return { ok: true, mounted, selector, injected: result };
+  return { ok: true, mounted: diag.ours || diag.anySkin, ours: diag.ours, wpCc: diag.wpCc, selector, isSkin: !!spec.isSkin, usedHost: result && result.usedHost, injected: result };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1257,7 +1263,11 @@ function setupLive(httpServer) {
               send({ t: "notice", msg: "Placerer annoncen her…" });
               try {
                 const r = await placeAdnamiAt(page, liveCreative, +msg.x, +msg.y);
-                send({ t: "notice", msg: (r && r.mounted) ? "Annonce placeret her ✓" : "Placeret, men formatet mountede ikke — prøv et andet sted på siden." });
+                let m;
+                if (r && r.ours) m = "Dit skin er placeret ✓";
+                else if (r && r.mounted) m = "Placeret, men det er ikke dit creative der vises (wpCc=" + (r.wpCc || "?") + ", isSkin=" + r.isSkin + ") — proxy/auktion henter måske ikke dit creative.";
+                else m = "Formatet mountede ikke (host=" + (r && r.usedHost || "?") + ", selector=" + (r && r.selector || "?") + ", isSkin=" + (r && r.isSkin) + ").";
+                send({ t: "notice", msg: m });
               } catch (e) { send({ t: "notice", msg: "Placering fejlede: " + String(e.message || e) }); }
             }
           }).catch(() => {});
