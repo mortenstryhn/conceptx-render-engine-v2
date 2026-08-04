@@ -49,7 +49,7 @@ const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // 
 const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width (page still renders at full viewport)
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
-const ENGINE_VERSION  = "2.46-autoreplace-any";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.48-robust-nav";                                         // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -563,6 +563,22 @@ async function clearSiteHighImpact(page, keepCc) {
 // real, fully-initialised Adnami placement is what lets high-impact formats (incl.
 // skins) perform their full page takeover. Falls back to a synthetic tag if the page
 // has no live Adnami slot.
+// Navigate robustly through a flaky residential proxy: retry up to 4× and — crucially —
+// verify the tab didn't land on chrome-error://chromewebdata/ (a failed/reset connection).
+async function robustGoto(page, url, send) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try { await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }); }
+    catch (e) { /* check the resulting URL below before deciding */ }
+    let cur = ""; try { cur = page.url(); } catch (e) {}
+    if (cur && !cur.startsWith("chrome-error") && cur !== "about:blank") return true;
+    if (attempt < 3) {
+      if (send) send({ t: "status", msg: "Forbindelsen fejlede — prøver igen (" + (attempt + 2) + "/4)…" });
+      await page.waitForTimeout(900 + attempt * 900);
+    }
+  }
+  return false;
+}
+
 async function injectAdnami(page, creativeCode, placement, preSpec) {
   let spec = preSpec || { width: 300, height: 240, type: "" };
   let fetchNote = "";
@@ -590,7 +606,10 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
     // AUTO-REPLACE: find a RUNNING ad of the SAME format as our creative and swap it in place.
     // Matched via Adnami's own format id (data-adnm-fid) — site-agnostic, no slot names.
     const kw = formatKeyword(spec);
-    const pt = await page.evaluate(({ ourCc, kw, isSkin }) => {
+    const info = await page.evaluate(({ ourCc, kw, isSkin }) => {
+      const all = Array.from(document.querySelectorAll("[data-adnm-fid]"));
+      const fids = all.map((el) => (el.getAttribute("data-adnm-fid") || "").toLowerCase()).filter(Boolean);
+      let pt = null;
       // SKIN → use the running wallpaper (content-centre, top band of the skin position).
       if (isSkin) {
         const wraps = Array.from(document.querySelectorAll(".adsm-sticky-wrapper"));
@@ -602,32 +621,34 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
             const wl = wr.querySelector(".adsm-wallpaper-l"), wrr = wr.querySelector(".adsm-wallpaper-r");
             let cx = Math.round(window.innerWidth / 2);
             if (wl && wrr) { const a = wl.getBoundingClientRect(), b = wrr.getBoundingClientRect(); cx = Math.round((a.right + b.left) / 2); }
-            return { x: cx, y: Math.round(wp.getBoundingClientRect().top + 20) };
+            pt = { x: cx, y: Math.round(wp.getBoundingClientRect().top + 20) }; break;
           }
         }
-        return null;
+        return { pt, fids, kw };
       }
       // NON-SKIN → find a rendered ad whose format id contains our format keyword, scroll it
       // into view, and return its centre (so elementFromPoint can resolve its slot).
-      if (!kw) return null;
-      for (const el of Array.from(document.querySelectorAll("[data-adnm-fid]"))) {
-        const fid = (el.getAttribute("data-adnm-fid") || "").toLowerCase();
-        const cc = (el.getAttribute("data-adnm-cc") || "").toLowerCase();
-        if (!fid.includes(kw) || cc === ourCc) continue;
-        let r = el.getBoundingClientRect();
-        if (r.width < 20 || r.height < 20) continue;
-        el.scrollIntoView({ block: "center" });
-        r = el.getBoundingClientRect();
-        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + Math.min(r.height / 2, 150)) };
+      if (kw) {
+        for (const el of all) {
+          const fid = (el.getAttribute("data-adnm-fid") || "").toLowerCase();
+          const cc = (el.getAttribute("data-adnm-cc") || "").toLowerCase();
+          if (!fid.includes(kw) || cc === ourCc) continue;
+          let r = el.getBoundingClientRect();
+          if (r.width < 20 || r.height < 20) continue;
+          el.scrollIntoView({ block: "center" });
+          r = el.getBoundingClientRect();
+          pt = { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + Math.min(r.height / 2, 150)) };
+          break;
+        }
       }
-      return null;
-    }, { ourCc: (creativeCode || "").toLowerCase(), kw, isSkin: !!spec.isSkin }).catch(() => null);
-    if (pt) {
-      const rr = await placeAdnamiAt(page, creativeCode, pt.x, pt.y, true); // warmed: skip 2nd ad-load
+      return { pt, fids, kw };
+    }, { ourCc: (creativeCode || "").toLowerCase(), kw, isSkin: !!spec.isSkin }).catch(() => ({ pt: null, fids: [], kw }));
+    if (info && info.pt) {
+      const rr = await placeAdnamiAt(page, creativeCode, info.pt.x, info.pt.y, true); // warmed: skip 2nd ad-load
       return { ok: true, mounted: !!(rr && rr.mounted), ours: !!(rr && rr.ours), auto: true, isSkin: !!spec.isSkin };
     }
     // No matching running ad → show the real ads and let the user point the crosshair.
-    return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: !!spec.isSkin };
+    return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: !!spec.isSkin, kw, fids: (info && info.fids) || [], formatName: spec.formatName };
   }
 
   // For a SKIN, clear the site's OWN competing skin first (once) — otherwise the site's
@@ -1231,6 +1252,7 @@ function setupLive(httpServer) {
     let idleTimer = null;
     let manualConsent = false;
     let liveCreative = "", livePlacement = ""; // Adnami creative kept for re-injection after nav/reload
+    let liveUrl = ""; // last good URL, so "reload" recovers even from a chrome-error tab
     let q = Promise.resolve(); // serialises input events so they apply in order
 
     const send = (obj) => { try { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); } catch {} };
@@ -1242,7 +1264,7 @@ function setupLive(httpServer) {
         const r = await injectAdnami(page, liveCreative, livePlacement);
         let m;
         if (r && r.ours) m = "Dit format er vist ✓";
-        else if (r && r.needsPlacement) m = "Siden vises med de rigtige annoncer. Tryk Vælg placering og klik der, hvor dit format skal ind.";
+        else if (r && r.needsPlacement) m = "Ingen auto-match (format=\"" + (r.formatName || "?") + "\", nøgleord=\"" + (r.kw || "") + "\", fids på siden: [" + ((r.fids || []).join(", ") || "ingen") + "]). Tryk Vælg placering og klik der, hvor dit format skal ind.";
         else if (r && r.mounted) m = "Adnami-format indsat ✓";
         else m = "Adnami-tag indsat, men formatet mountede ikke (tjek ID/format-type).";
         send({ t: "notice", msg: m });
@@ -1285,6 +1307,7 @@ function setupLive(httpServer) {
           let url;
           try { url = await assertSafeUrl(msg.url); }
           catch (e) { send({ t: "error", msg: e.message }); return; }
+          liveUrl = url;
 
           send({ t: "status", msg: "Åbner side…" });
           context = await (await getBrowser()).newContext({
@@ -1332,14 +1355,9 @@ function setupLive(httpServer) {
             catch (e) { liveCreative = ""; send({ t: "notice", msg: e.message }); }
           }
 
-          // Navigate with one retry — a single proxy hiccup otherwise leaves the tab on
-          // chrome-error://chromewebdata/. Retry once before giving up.
-          let navOk = false;
-          for (let attempt = 0; attempt < 2 && !navOk; attempt++) {
-            try { await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }); navOk = true; }
-            catch (e) { if (attempt === 0) { send({ t: "status", msg: "Prøver igen…" }); await page.waitForTimeout(700); } }
-          }
-          if (!navOk) send({ t: "notice", msg: "Siden var langsom at hente (proxy). Tryk genindlæs hvis den ikke kom frem." });
+          // Robust navigation (retries + verifies it didn't land on chrome-error).
+          const navOk = await robustGoto(page, url, send);
+          if (!navOk) send({ t: "notice", msg: "Kunne ikke hente siden gennem proxy'en efter flere forsøg. Tryk genindlæs, eller prøv igen om lidt." });
           if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); }
           await doInject();
         }
@@ -1365,9 +1383,12 @@ function setupLive(httpServer) {
             else if (msg.t === "nav") {
               if (msg.action === "back") await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
               else if (msg.action === "forward") await page.goForward({ waitUntil: "domcontentloaded" }).catch(() => {});
-              else if (msg.action === "reload") { await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {}); await doInject(); }
+              else if (msg.action === "reload") {
+                let target = page.url(); if (!target || target.startsWith("chrome-error") || target === "about:blank") target = liveUrl;
+                if (target) { await robustGoto(page, target, send); if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); } await doInject(); }
+              }
               else if (msg.action === "goto" && msg.url) {
-                try { const su = await assertSafeUrl(msg.url); await page.goto(su, { waitUntil: "domcontentloaded" }); if (!manualConsent) await dismissConsent(page); await doInject(); }
+                try { const su = await assertSafeUrl(msg.url); liveUrl = su; await robustGoto(page, su, send); if (!manualConsent) await dismissConsent(page); await doInject(); }
                 catch (e) { send({ t: "error", msg: e.message }); }
               }
             }
