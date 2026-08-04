@@ -49,7 +49,7 @@ const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // 
 const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width (page still renders at full viewport)
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
-const ENGINE_VERSION  = "2.43-fast-mount";                                         // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.44-all-formats";                                        // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -613,38 +613,42 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   result = await page.evaluate(({ creativeCode, spec, engineSrc, placement, isSkin }) => {
     try {
       document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
-      if (isSkin) {
-        const html = document.documentElement;
-        Array.from(html.classList).forEach((k) => { if (/^adsm-skin/i.test(k)) html.classList.remove(k); });
-      }
       let host = null;
       if (placement) { try { host = document.querySelector(placement); } catch (e) { host = null; } }
       if (!host) host = document.body;
-      if (isSkin && host !== document.body) host.querySelectorAll("iframe, div[id^='google_ads_iframe']").forEach((k) => k.remove());
-      const ifr = document.createElement("iframe");
-      ifr.width = "0"; ifr.height = "0";
-      ifr.style.cssText = "width:0;height:0;border:0;";
-      ifr.setAttribute("data-cx-injected", "");
-      ifr.setAttribute("adnm-preview-adunit", "true");
-      host.appendChild(ifr);
-      const d = ifr.contentWindow && ifr.contentWindow.document;
-      if (!d) return { ok: false, reason: "no-doc" };
-      d.open(); d.write('<!doctype html><html><head></head><body style="margin:0"></body></html>'); d.close();
-      const holder = d.createElement("div");
-      const ins = d.createElement("ins");
-      ins.className = "adnm-tag";
-      ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
-      ins.setAttribute("data-adnm-cc", creativeCode);
-      if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-      ins.setAttribute("data-adnm-click", "");
-      ins.setAttribute("data-adnm-session", String(Date.now()));
-      ins.setAttribute("data-adnm-unload", "");
-      ins.setAttribute("data-adnm-custom-adnm_preview", "link");
-      holder.appendChild(ins);
-      const s = d.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc;
-      ins.appendChild(s);
-      d.body.appendChild(holder);
-      return { ok: true, usedHost: host.id || host.tagName };
+      const mkIns = (doc) => {
+        const ins = doc.createElement("ins");
+        ins.className = "adnm-tag";
+        ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
+        ins.setAttribute("data-adnm-cc", creativeCode);
+        if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+        ins.setAttribute("data-adnm-click", "");
+        ins.setAttribute("data-adnm-session", String(Date.now()));
+        ins.setAttribute("data-adnm-unload", "");
+        ins.setAttribute("data-adnm-custom-adnm_preview", "link");
+        const s = doc.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc; ins.appendChild(s);
+        return ins;
+      };
+      if (isSkin) {
+        const html = document.documentElement;
+        Array.from(html.classList).forEach((k) => { if (/^adsm-skin/i.test(k)) html.classList.remove(k); });
+        if (host !== document.body) host.querySelectorAll("iframe, div[id^='google_ads_iframe']").forEach((k) => k.remove());
+        const ifr = document.createElement("iframe");
+        ifr.width = "0"; ifr.height = "0"; ifr.style.cssText = "width:0;height:0;border:0;";
+        ifr.setAttribute("data-cx-injected", ""); ifr.setAttribute("adnm-preview-adunit", "true");
+        host.appendChild(ifr);
+        const d = ifr.contentWindow && ifr.contentWindow.document;
+        if (!d) return { ok: false, reason: "no-doc" };
+        d.open(); d.write('<!doctype html><html><head></head><body style="margin:0"></body></html>'); d.close();
+        const holder = d.createElement("div"); holder.appendChild(mkIns(d)); d.body.appendChild(holder);
+        return { ok: true, mode: "skin-iframe", usedHost: host.id || host.tagName };
+      }
+      // In-content format: a real sized <ins> so it renders visibly.
+      const wrap = document.createElement("div");
+      wrap.setAttribute("data-cx-injected", ""); wrap.style.cssText = "display:block;max-width:100%";
+      wrap.appendChild(mkIns(document));
+      if (host === document.body && host.firstChild) host.insertBefore(wrap, host.firstChild); else host.appendChild(wrap);
+      return { ok: true, mode: "sized-ins", usedHost: host.id || host.tagName };
     } catch (e) { return { ok: false, reason: String(e && e.message || e) }; }
   }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, placement: placement || "", isSkin: !!spec.isSkin });
   method = "auto-iframe";
@@ -672,16 +676,25 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
 
   if (!result || !result.ok) throw new Error("Kunne ikke forankre Adnami-preview på siden" + (fetchNote ? (" (" + fetchNote + ")") : ""));
 
-  // Poll (max ~7s) — return AS SOON AS the format mounts, instead of a fixed wait.
-  let mounted = false;
+  // Poll (max ~7s) — return AS SOON AS OUR creative renders (format-agnostic).
+  let mounted = false, ours = false;
   for (let i = 0; i < 14; i++) {
     await page.waitForTimeout(500);
-    mounted = await page.evaluate(
-      () => !!document.querySelector('.adsm-sticky-wrapper, [class*="adsm-wallpaper"], [data-adnm-fid]')
-    ).catch(() => false);
-    if (mounted) break;
+    const d = await page.evaluate((cc) => {
+      cc = (cc || "").toLowerCase();
+      let present = false, rendered = false;
+      document.querySelectorAll("[data-adnm-cc]").forEach((el) => {
+        if ((el.getAttribute("data-adnm-cc") || "").toLowerCase() === cc) {
+          present = true;
+          if (el.classList.contains("adsm-wallpaper") || el.querySelector("iframe")) rendered = true;
+        }
+      });
+      return { present, rendered };
+    }, creativeCode).catch(() => ({ present: false, rendered: false }));
+    mounted = d.rendered || d.present; ours = d.rendered;
+    if (d.rendered) break;
   }
-  return { ok: true, mounted, method, hasSlot, fetchNote, isSkin: spec.isSkin };
+  return { ok: true, mounted, ours, method, hasSlot, fetchNote, isSkin: spec.isSkin };
 }
 
 // Re-place the creative at a clicked point (device CSS px). To guarantee the ad
@@ -732,60 +745,77 @@ async function placeAdnamiAt(page, creativeCode, x, y, warmed) {
   // Remove ONLY a competing SKIN — topscroll / midscroll / other ads stay untouched.
   if (spec.isSkin) await clearSiteHighImpact(page, creativeCode);
 
-  // 3) Inject a hidden 0×0 same-origin iframe INTO the site's own slot (the proven method).
-  //    For a SKIN we first strip only the OLD skin's html classes (keep topscroll classes so
-  //    its offset is preserved and the slot stays at the right position UNDER the topscroll)
-  //    and empty the slot's old ad content — so our skin builds from the slot's top.
+  // 3) Inject INTO the site's own slot, branching by how the format renders:
+  //     • SKIN → 0×0 same-origin iframe (the engine escapes it and paints the full-page
+  //       takeover with wings). Strip only old skin classes; keep topscroll offset.
+  //     • EVERY OTHER FORMAT (midscroll / interscroll / banner …) renders IN PLACE, so it
+  //       needs a real SIZED <ins> in the slot — a 0×0 anchor would make it invisible.
   const result = await page.evaluate(({ creativeCode, spec, engineSrc, selector, isSkin }) => {
     try {
       document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
-      if (isSkin) {
-        const html = document.documentElement;
-        Array.from(html.classList).forEach((k) => { if (/^adsm-skin/i.test(k)) html.classList.remove(k); });
-      }
       let host = null;
       if (selector) { try { host = document.querySelector(selector); } catch (e) { host = null; } }
       if (!host) host = document.body;
-      // Empty ONLY the target skin slot of its old ad content before building.
-      if (isSkin && host !== document.body) host.querySelectorAll("iframe, div[id^='google_ads_iframe']").forEach((k) => k.remove());
-      const ifr = document.createElement("iframe");
-      ifr.width = "0"; ifr.height = "0"; ifr.style.cssText = "width:0;height:0;border:0;";
-      ifr.setAttribute("data-cx-injected", "");
-      ifr.setAttribute("adnm-preview-adunit", "true");
-      host.appendChild(ifr);
-      const d = ifr.contentWindow && ifr.contentWindow.document;
-      if (!d) return { ok: false, reason: "no-doc" };
-      d.open(); d.write('<!doctype html><html><head></head><body style="margin:0"></body></html>'); d.close();
-      const holder = d.createElement("div");
-      const ins = d.createElement("ins");
-      ins.className = "adnm-tag";
-      ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
-      ins.setAttribute("data-adnm-cc", creativeCode);
-      if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
-      ins.setAttribute("data-adnm-click", "");
-      ins.setAttribute("data-adnm-session", String(Date.now()));
-      ins.setAttribute("data-adnm-unload", "");
-      ins.setAttribute("data-adnm-custom-adnm_preview", "link");
-      holder.appendChild(ins);
-      const s = d.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc; ins.appendChild(s);
-      d.body.appendChild(holder);
-      return { ok: true, usedHost: host.id || host.tagName };
+      // Empty the clicked slot's old ad content so OUR creative replaces it in the same spot.
+      if (host !== document.body) host.querySelectorAll("iframe, div[id^='google_ads_iframe']").forEach((k) => k.remove());
+
+      const mkIns = (doc) => {
+        const ins = doc.createElement("ins");
+        ins.className = "adnm-tag";
+        ins.style.cssText = `display:inline-block;width:${spec.width}px;height:${spec.height}px`;
+        ins.setAttribute("data-adnm-cc", creativeCode);
+        if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+        ins.setAttribute("data-adnm-click", "");
+        ins.setAttribute("data-adnm-session", String(Date.now()));
+        ins.setAttribute("data-adnm-unload", "");
+        ins.setAttribute("data-adnm-custom-adnm_preview", "link");
+        const s = doc.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc; ins.appendChild(s);
+        return ins;
+      };
+
+      if (isSkin) {
+        const html = document.documentElement;
+        Array.from(html.classList).forEach((k) => { if (/^adsm-skin/i.test(k)) html.classList.remove(k); });
+        const ifr = document.createElement("iframe");
+        ifr.width = "0"; ifr.height = "0"; ifr.style.cssText = "width:0;height:0;border:0;";
+        ifr.setAttribute("data-cx-injected", ""); ifr.setAttribute("adnm-preview-adunit", "true");
+        host.appendChild(ifr);
+        const d = ifr.contentWindow && ifr.contentWindow.document;
+        if (!d) return { ok: false, reason: "no-doc" };
+        d.open(); d.write('<!doctype html><html><head></head><body style="margin:0"></body></html>'); d.close();
+        const holder = d.createElement("div"); holder.appendChild(mkIns(d)); d.body.appendChild(holder);
+        return { ok: true, mode: "skin-iframe", usedHost: host.id || host.tagName };
+      }
+      // In-content format: a real sized <ins> straight in the slot (visible).
+      const wrap = document.createElement("div");
+      wrap.setAttribute("data-cx-injected", "");
+      wrap.style.cssText = "display:block;max-width:100%";
+      wrap.appendChild(mkIns(document));
+      host.appendChild(wrap);
+      return { ok: true, mode: "sized-ins", usedHost: host.id || host.tagName };
     } catch (e) { return { ok: false, reason: String(e && e.message || e) }; }
   }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC, selector, isSkin: !!spec.isSkin });
 
-  // 4) Poll (max ~7s) — return AS SOON AS our skin mounts, instead of a fixed wait.
-  let diag = { ours: false, anySkin: false, wpCc: "" };
+  // 4) Poll (max ~7s) — return AS SOON AS OUR creative renders (format-agnostic: it either
+  //    becomes a wallpaper, or its <ins> gets a rendered iframe child).
+  let diag = { ours: false, present: false };
   for (let i = 0; i < 14; i++) {
     await page.waitForTimeout(500);
     diag = await page.evaluate((cc) => {
-      const wp = document.querySelector(".adsm-wallpaper[data-adnm-cc]");
-      const wpCc = wp ? (wp.getAttribute("data-adnm-cc") || "").toLowerCase() : "";
-      return { ours: !!(wpCc && wpCc === (cc || "").toLowerCase()), anySkin: !!document.querySelector('.adsm-sticky-wrapper, [data-adnm-fid]'), wpCc };
+      cc = (cc || "").toLowerCase();
+      let present = false, rendered = false;
+      document.querySelectorAll("[data-adnm-cc]").forEach((el) => {
+        if ((el.getAttribute("data-adnm-cc") || "").toLowerCase() === cc) {
+          present = true;
+          if (el.classList.contains("adsm-wallpaper") || el.querySelector("iframe")) rendered = true;
+        }
+      });
+      return { ours: rendered, present };
     }, creativeCode).catch(() => diag);
     if (diag.ours) break;
   }
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
-  return { ok: true, mounted: diag.ours || diag.anySkin, ours: diag.ours, wpCc: diag.wpCc, selector, isSkin: !!spec.isSkin, usedHost: result && result.usedHost, injected: result };
+  return { ok: true, mounted: diag.ours || diag.present, ours: diag.ours, present: diag.present, selector, isSkin: !!spec.isSkin, usedHost: result && result.usedHost, injected: result };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1180,7 +1210,7 @@ function setupLive(httpServer) {
       try {
         const r = await injectAdnami(page, liveCreative, livePlacement);
         let m;
-        if (r && r.ours) m = "Dit skin er placeret ✓";
+        if (r && r.ours) m = "Dit format er vist ✓";
         else if (r && r.needsPlacement) m = "Siden vises med de rigtige annoncer. Tryk Vælg placering og klik på annoncen, hvor dit skin skal ind.";
         else if (r && r.mounted) m = "Adnami-format indsat ✓";
         else m = "Adnami-tag indsat, men formatet mountede ikke (tjek ID/format-type).";
@@ -1316,8 +1346,8 @@ function setupLive(httpServer) {
               try {
                 const r = await placeAdnamiAt(page, liveCreative, +msg.x, +msg.y);
                 let m;
-                if (r && r.ours) m = "Dit skin er placeret ✓";
-                else if (r && r.mounted) m = "Placeret, men det er ikke dit creative der vises (wpCc=" + (r.wpCc || "?") + ", isSkin=" + r.isSkin + ") — proxy/auktion henter måske ikke dit creative.";
+                if (r && r.ours) m = "Dit format er placeret ✓";
+                else if (r && r.present) m = "Dit tag blev sat ind, men creativet renderede ikke (isSkin=" + (r && r.isSkin) + ") — proxy/auktion henter måske ikke dit creative.";
                 else m = "Formatet mountede ikke (host=" + (r && r.usedHost || "?") + ", selector=" + (r && r.selector || "?") + ", isSkin=" + (r && r.isSkin) + ").";
                 send({ t: "notice", msg: m });
               } catch (e) { send({ t: "notice", msg: "Placering fejlede: " + String(e.message || e) }); }
