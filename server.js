@@ -52,7 +52,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.57-fps-unthrottled";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.58-safe-proxy";                                         // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -159,33 +159,38 @@ function upstreamProxyUrl() {
 let relayUrl = null;    // local proxy URL once the selective relay is up
 let relayServer = null; // the proxy-chain Server instance (selective routing)
 
-// SELECTIVE PROXY ROUTING — only ad-tech / RTB domains go through the Danish residential
-// proxy (they must see a DK IP so the ad auction fills the Danish high-impact formats).
-// Everything else — the site's own content, images, fonts, CDNs — goes DIRECT (fast).
-// The list matches the ad exchange + SSP + Adnami domains that carry the user's IP; add
-// more via PROXY_AD_DOMAINS (comma-separated) if a site uses an SSP we don't cover.
-const AD_PROXY_HOSTS = (process.env.PROXY_AD_DOMAINS ||
-  [
-    "adnami.io",                       // Adnami engine, macro, RTB (the high-impact formats)
-    "doubleclick.net", "g.doubleclick.net", "googlesyndication.com", "googletagservices.com",
-    "googleadservices.com", "adservice.google", "2mdn.net", "gstatic.com",   // Google ad stack (runs the auction)
-    "adnxs.com", "adform.net", "rubiconproject.com", "pubmatic.com", "openx.net",
-    "criteo.com", "criteo.net", "smartadserver.com", "sascdn.com", "casalemedia.com",
-    "3lift.com", "adsrvr.org", "id5-sync.com", "gumgum.com", "teads.tv", "yieldlab.net",
-    "improvedigital.com", "360yield.com", "sharethrough.com", "indexexchange.com",
-    "onetag.com", "sovrn.com", "lijit.com", "media.net", "amazon-adsystem.com",
-    "relevant-digital.com", "relevantdigital.com", "prebid", "rmbl.ws",
-    "ipinfo.io", "ip.decodo.com", "decodo.com",   // IP-echo hosts so /myip reflects the DK proxy path
-  ].join(",")
+// SELECTIVE PROXY ROUTING — SAFE-FOR-ADS design. An allowlist of ad domains is fragile
+// (each site uses different SSPs; miss one → its ads don't fill). So we INVERT it: send ALL
+// third-party traffic (which is where every ad exchange lives) through the Danish proxy, and
+// only the page's OWN content + well-known static CDNs go DIRECT (fast). Ads always fill
+// regardless of which SSP a site uses; the heavy first-party images still load direct.
+const MULTI_TLD_RE = /\.(co\.uk|gov\.uk|org\.uk|com\.au|net\.au|org\.au|co\.jp|ac\.jp|co\.nz|com\.br|com\.mx|co\.il|com\.tr|com\.hk|com\.sg)$/i;
+function registrableDomain(host) {
+  host = (host || "").toLowerCase().replace(/\.$/, "");
+  const parts = host.split(".").filter(Boolean);
+  const take = MULTI_TLD_RE.test(host) ? 3 : 2;
+  return parts.length <= take ? host : parts.slice(-take).join(".");
+}
+// The page's own registrable domains, registered per navigation → loaded DIRECT.
+const FIRST_PARTY = new Set();
+function registerFirstParty(url) { try { FIRST_PARTY.add(registrableDomain(new URL(url).hostname)); } catch (e) {} }
+// Pure static content CDNs (geo-irrelevant) that are safe + beneficial to load DIRECT.
+const DIRECT_CDNS = (process.env.PROXY_DIRECT_CDNS ||
+  "fonts.gstatic.com,fonts.googleapis.com,cdnjs.cloudflare.com,jsdelivr.net,unpkg.com,cloudfront.net,akamaihd.net,akamaized.net,akamai.net,fastly.net,imgix.net,cloudinary.com,gstatic.com,ytimg.com"
 ).split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const PROXY_ALL = (process.env.PROXY_ALL || "false") === "true"; // escape hatch: force everything through the proxy
 
 function shouldProxyHost(hostname) {
   const h = (hostname || "").toLowerCase();
-  return AD_PROXY_HOSTS.some((dom) => h === dom || h.endsWith("." + dom) || h.includes(dom));
+  if (PROXY_ALL) return true;
+  const rd = registrableDomain(h);
+  for (const d of FIRST_PARTY) { if (rd === d || h === d || h.endsWith("." + d)) return false; } // first-party → direct
+  if (DIRECT_CDNS.some((d) => h === d || h.endsWith("." + d))) return false;                       // static CDN → direct
+  return true;                                                                                     // everything else (all ad tech) → DK proxy
 }
 
 const proxyInfo = () => PROXY
-  ? { enabled: true, server: PROXY.server, auth: !!PROXY.username, relay: !!relayUrl, selective: !!relayServer, adDomains: AD_PROXY_HOSTS.length }
+  ? { enabled: true, server: PROXY.server, auth: !!PROXY.username, relay: !!relayUrl, selective: !!relayServer, mode: PROXY_ALL ? "all-through" : "third-party-via-DK", firstParty: Array.from(FIRST_PARTY) }
   : { enabled: false };
 if (PROXY) console.log(`Proxy aktiv → ${PROXY.server}${PROXY.username ? " (login via lokal relay)" : ""}`);
 
@@ -1349,6 +1354,7 @@ app.get("/render", async (req, res) => {
   let safeUrl;
   try { safeUrl = await assertSafeUrl(rawUrl); }
   catch (e) { return res.status(400).json({ error: e.message }); }
+  registerFirstParty(safeUrl);
 
   const key = [normalizeCacheUrl(safeUrl), device, landscape, fullPage, format, manualConsent, creative, placement].join("|");
   if (!fresh) {
@@ -1485,7 +1491,7 @@ function setupLive(httpServer) {
           let url;
           try { url = await assertSafeUrl(msg.url); }
           catch (e) { send({ t: "error", msg: e.message }); return; }
-          liveUrl = url;
+          liveUrl = url; registerFirstParty(url);
 
           send({ t: "status", msg: "Åbner side…" });
           context = await (await getBrowser()).newContext({
@@ -1586,7 +1592,7 @@ function setupLive(httpServer) {
                 if (target) { await robustGoto(page, target, send); if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); } await doInject(); }
               }
               else if (msg.action === "goto" && msg.url) {
-                try { const su = await assertSafeUrl(msg.url); liveUrl = su; await robustGoto(page, su, send); if (!manualConsent) await dismissConsent(page); await doInject(); }
+                try { const su = await assertSafeUrl(msg.url); liveUrl = su; registerFirstParty(su); await robustGoto(page, su, send); if (!manualConsent) await dismissConsent(page); await doInject(); }
                 catch (e) { send({ t: "error", msg: e.message }); }
               }
             }
