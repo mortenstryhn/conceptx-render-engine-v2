@@ -23,6 +23,8 @@
 import express from "express";
 import dns from "node:dns/promises";
 import net from "node:net";
+import os from "node:os";
+import { performance } from "node:perf_hooks";
 import { WebSocketServer } from "ws";
 import { chromium } from "playwright";
 import ProxyChain from "proxy-chain";
@@ -50,13 +52,70 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "2", 10);// SMOOTHNESS lever on big viewports: send every Nth frame (higher = lighter CPU, choppier motion; sharpness unaffected)
-const ENGINE_VERSION  = "2.54-adaptive";                                           // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.55-instrumented";                                       // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
 // and takes down every in-flight preview. Log and keep serving instead.
 process.on("uncaughtException", (e) => { try { console.error("uncaughtException:", e && e.stack || e); } catch {} });
 process.on("unhandledRejection", (e) => { try { console.error("unhandledRejection:", e && e.stack || e); } catch {} });
+
+/* ------------------------------------------------------------------ *
+ * METRICS — "measure first". Live-stream + render counters exposed on *
+ * /health so we can see whether the desktop stutter is CPU-, band-    *
+ * width- or latency-bound instead of guessing.                        *
+ * ------------------------------------------------------------------ */
+const METRICS = {
+  startedAt: Date.now(),
+  cpuPercent: 0,                                   // % of ONE core (≈100 = one core pinned)
+  cores: os.cpus() ? os.cpus().length : 1,
+  renders: { total: 0, active: 0, queueDepth: 0 },
+  live: { active: 0, total: 0 },
+  frames: { sent: 0, dropped: 0, bytesSent: 0 },   // cumulative
+  _cpuLast: process.cpuUsage(),
+  _cpuAt: Date.now(),
+  _win: [],                                        // recent frames: { at, bytes, buffered, sendMs, latMs }
+  _rtt: null,                                      // last measured client round-trip (ms), if the client echoes pings
+};
+// CPU% sampler (share of one core; >100 possible if the process uses multiple cores).
+setInterval(() => {
+  try {
+    const now = Date.now();
+    const u = process.cpuUsage(METRICS._cpuLast);
+    const elapsed = now - METRICS._cpuAt;
+    const cpuMs = (u.user + u.system) / 1000;
+    METRICS.cpuPercent = elapsed > 0 ? Math.round((cpuMs / elapsed) * 100) : 0;
+    METRICS._cpuLast = process.cpuUsage();
+    METRICS._cpuAt = now;
+  } catch (e) {}
+}, 2000).unref?.();
+
+function recordFrame({ bytes, sent, buffered, sendMs, latMs }) {
+  METRICS.frames.sent += sent ? 1 : 0;
+  METRICS.frames.dropped += sent ? 0 : 1;
+  METRICS.frames.bytesSent += sent ? (bytes || 0) : 0;
+  const at = Date.now();
+  METRICS._win.push({ at, bytes: bytes || 0, buffered: buffered || 0, sendMs: sendMs || 0, latMs: (typeof latMs === "number" ? latMs : null), sent: !!sent });
+  // keep ~last 4 seconds
+  const cutoff = at - 4000;
+  while (METRICS._win.length && METRICS._win[0].at < cutoff) METRICS._win.shift();
+}
+function streamStats() {
+  const w = METRICS._win;
+  if (!w.length) return { fps: 0, avgFrameKB: 0, dropRatePct: 0, peakBufferedKB: 0, lastSendMs: 0, frameLatencyMs: METRICS._rtt };
+  const spanSec = Math.max(0.001, (w[w.length - 1].at - w[0].at) / 1000);
+  const sentFrames = w.filter((f) => f.sent);
+  const bytes = sentFrames.reduce((a, f) => a + f.bytes, 0);
+  const peakBuf = w.reduce((a, f) => Math.max(a, f.buffered), 0);
+  return {
+    fps: Math.round((sentFrames.length / spanSec) * 10) / 10,
+    avgFrameKB: sentFrames.length ? Math.round(bytes / sentFrames.length / 1024) : 0,
+    dropRatePct: w.length ? Math.round((w.filter((f) => !f.sent).length / w.length) * 100) : 0,
+    peakBufferedKB: Math.round(peakBuf / 1024),
+    lastSendMs: Math.round((w[w.length - 1].sendMs || 0) * 10) / 10,
+    frameLatencyMs: METRICS._rtt,                  // client round-trip, if the frontend echoes {t:"ping"} → {t:"pong"}
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * Outbound proxy (optional) — route the browser through a residential *
@@ -191,13 +250,15 @@ async function getBrowser() {
 let active = 0;
 const queue = [];
 function acquire() {
-  if (active < MAX_CONCURRENCY) { active++; return Promise.resolve(); }
+  METRICS.renders.total++;
+  if (active < MAX_CONCURRENCY) { active++; METRICS.renders.active = active; return Promise.resolve(); }
   return new Promise((res) => queue.push(res));
 }
 function release() {
   active--;
   const next = queue.shift();
   if (next) { active++; next(); }
+  METRICS.renders.active = active;
 }
 
 /* ------------------------------------------------------------------ *
@@ -213,6 +274,24 @@ function cacheGet(key) {
 function cacheSet(key, buf, type) {
   cache.set(key, { buf, type, at: Date.now() });
   if (cache.size > 200) cache.delete(cache.keys().next().value); // simple cap
+}
+// Quick win: strip tracking params (they don't change what renders) so the same page
+// caches regardless of utm/fbclid/gclid/token → better cache hit rate.
+const TRACKING_PARAMS = ["token", "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "fbclid", "gclid", "mc_cid", "mc_eid", "_ga", "msclkid", "igshid"];
+function normalizeCacheUrl(url) {
+  try {
+    const u = new URL(url);
+    TRACKING_PARAMS.forEach((p) => u.searchParams.delete(p));
+    return u.href;
+  } catch (e) { return url; }
+}
+// Quick win: device-aware full-page height cap. Mobile pages are captured shorter (less
+// memory + faster) than desktop; both stay within the global MAX_SHOT_HEIGHT safety cap.
+function adaptiveMaxHeight(dev) {
+  const base = (dev && dev.mobile)
+    ? parseInt(process.env.MAX_SHOT_HEIGHT_MOBILE || "2600", 10)
+    : parseInt(process.env.MAX_SHOT_HEIGHT_DESKTOP || "4000", 10);
+  return Math.min(base, MAX_SHOT_HEIGHT);
 }
 
 /* ------------------------------------------------------------------ *
@@ -636,10 +715,10 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   // We then REPLACE that real slot with the preview — exactly what the Adnami extension
   // does. Running inside the site's real skin container is what lets the wings paint;
   // a detached top-level <ins> only ever gets the top band, never the side wings.
-  const hasSlot = await loadPageAds(page);
-  // Ensure the engine context exists (lite macro), like the extension's loadAdsv2().
-  // Self-skips when the site's own engine is already up, so it's safe/no-op there.
-  await loadAdnamiContext(page);
+  // Quick win: load the Adnami macro context IN PARALLEL with the ad-scroll (they're
+  // independent) instead of sequentially — saves ~1-2s. loadAdnamiContext self-skips if the
+  // site's own engine is already up, so it's safe to run alongside the scroll.
+  const [hasSlot] = await Promise.all([loadPageAds(page), loadAdnamiContext(page)]);
 
   // LIVE tool: "Vis format" for a SKIN with NO chosen placement.
   //  • If the site is ALREADY running a (foreign) skin → auto-replace it in its own slot
@@ -846,7 +925,7 @@ async function placeAdnamiAt(page, creativeCode, x, y, warmed) {
   //    scroll+wait again — this is the big latency saver in the auto-skin flow).
   let spec = { width: 300, height: 240, type: "" };
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
-  if (!warmed) { await loadPageAds(page).catch(() => {}); await loadAdnamiContext(page); }
+  if (!warmed) { await Promise.all([loadPageAds(page).catch(() => {}), loadAdnamiContext(page).catch(() => {})]); }
   // Remove ONLY a competing SKIN — topscroll / midscroll / other ads stay untouched.
   if (spec.isSkin) await clearSiteHighImpact(page, creativeCode);
 
@@ -1012,7 +1091,7 @@ async function renderShot({ url, device, landscape, fullPage, format, manualCons
       pageH = await page.evaluate(() =>
         Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, window.innerHeight));
     } catch { /* keep default */ }
-    const capH = Math.max(vh, Math.min(pageH, MAX_SHOT_HEIGHT));
+    const capH = Math.max(vh, Math.min(pageH, adaptiveMaxHeight(dev)));
 
     try {
       await page.setViewportSize({ width: vw, height: capH });
@@ -1046,7 +1125,24 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: ENGINE_VERSION, proxy: proxyInfo(), devices: Object.keys(DEVICES) }));
+app.get("/health", (_req, res) => {
+  const mem = process.memoryUsage();
+  res.json({
+    ok: true,
+    version: ENGINE_VERSION,
+    proxy: proxyInfo(),
+    devices: Object.keys(DEVICES),
+    // --- instrumentation ("measure first") ---
+    uptimeSec: Math.round((Date.now() - METRICS.startedAt) / 1000),
+    cpuPercentOneCore: METRICS.cpuPercent,          // ≈100 = one core pinned (Standard has ~1 core)
+    cores: METRICS.cores,
+    loadAvg1: Math.round((os.loadavg()[0] || 0) * 100) / 100,
+    memory: { rssMB: Math.round(mem.rss / 1048576), heapUsedMB: Math.round(mem.heapUsed / 1048576) },
+    renders: { active: METRICS.renders.active, queueDepth: queue.length, total: METRICS.renders.total },
+    live: { active: METRICS.live.active, total: METRICS.live.total },
+    stream: streamStats(),                          // fps, avgFrameKB, dropRatePct, peakBufferedKB, lastSendMs, frameLatencyMs
+  });
+});
 
 // Confirm the OUTBOUND IP the browser actually uses. Open this (with ?token=…) after
 // setting PROXY_URL to verify you now have a Danish IP: it loads an IP-echo service
@@ -1199,7 +1295,7 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
       try {
         let pageH = dev.h;
         try { pageH = await page.evaluate(() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, window.innerHeight)); } catch {}
-        const capH = Math.max(dev.h, Math.min(pageH, MAX_SHOT_HEIGHT));
+        const capH = Math.max(dev.h, Math.min(pageH, adaptiveMaxHeight(dev)));
         await page.setViewportSize({ width: dev.w, height: capH });
         await page.waitForTimeout(600);
         const buf = await page.screenshot({ type: "jpeg", quality: 82 });
@@ -1244,7 +1340,7 @@ app.get("/render", async (req, res) => {
   try { safeUrl = await assertSafeUrl(rawUrl); }
   catch (e) { return res.status(400).json({ error: e.message }); }
 
-  const key = [safeUrl, device, landscape, fullPage, format, manualConsent, creative, placement].join("|");
+  const key = [normalizeCacheUrl(safeUrl), device, landscape, fullPage, format, manualConsent, creative, placement].join("|");
   if (!fresh) {
     const hit = cacheGet(key);
     if (hit) {
@@ -1302,10 +1398,12 @@ function setupLive(httpServer) {
     }
 
     liveCount++;
+    METRICS.live.active++; METRICS.live.total++;
     let context = null, page = null, cdp = null, closed = false, started = false;
     let idleTimer = null;
     let manualConsent = false;
     let motionTimer = null;            // adaptive stream: revert-to-sharp timer
+    let pingTimer = null;              // RTT probe (client echoes {t:"ping"} → {t:"pong"})
     let enterMotion = () => {};        // set up once the screencast is running
     let liveCreative = "", livePlacement = ""; // Adnami creative kept for re-injection after nav/reload
     let liveUrl = ""; // last good URL, so "reload" recovers even from a chrome-error tab
@@ -1343,7 +1441,9 @@ function setupLive(httpServer) {
       if (closed) return; closed = true;
       if (idleTimer) clearTimeout(idleTimer);
       if (motionTimer) clearTimeout(motionTimer);
+      if (pingTimer) clearInterval(pingTimer);
       liveCount = Math.max(0, liveCount - 1);
+      METRICS.live.active = Math.max(0, METRICS.live.active - 1);
       try { if (cdp) await cdp.detach(); } catch {}
       try { if (context) await context.close(); } catch {}
       try { ws.close(); } catch {}
@@ -1354,6 +1454,9 @@ function setupLive(httpServer) {
     ws.on("message", async (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
       bumpIdle();
+      // RTT probe: client echoes our {t:"ping",ts} back as {t:"pong",ts}. If the frontend
+      // doesn't echo, frameLatencyMs on /health simply stays null (harmless).
+      if (msg.t === "pong") { if (typeof msg.ts === "number") METRICS._rtt = Math.max(0, Date.now() - msg.ts); return; }
       try {
         if (msg.t === "start") {
           if (started) return; started = true;
@@ -1403,7 +1506,18 @@ function setupLive(httpServer) {
           cdp.on("Page.screencastFrame", async (f) => {
             // Drop this frame if the socket is already backed up — always show the
             // freshest frame instead of building a growing delay on slow links.
-            try { if (ws.readyState === 1 && ws.bufferedAmount < 800000) ws.send(Buffer.from(f.data, "base64")); } catch {}
+            const bytes = f && f.data ? Math.floor(f.data.length * 0.75) : 0; // base64 → ~bytes
+            const buffered = (ws.readyState === 1) ? ws.bufferedAmount : 0;
+            let sent = false, sendMs = 0;
+            try {
+              if (ws.readyState === 1 && ws.bufferedAmount < 800000) {
+                const t0 = performance.now();
+                ws.send(Buffer.from(f.data, "base64"));
+                sendMs = performance.now() - t0;
+                sent = true;
+              }
+            } catch {}
+            recordFrame({ bytes, sent, buffered, sendMs });
             try { await cdp.send("Page.screencastFrameAck", { sessionId: f.sessionId }); } catch {}
           });
           // Cap the STREAMED frame size (page still renders at full viewport for correct
@@ -1432,6 +1546,9 @@ function setupLive(httpServer) {
             };
           }
           send({ t: "ready", w: vw, h: vh, url });
+          // Periodic RTT probe (client should echo {t:"ping"} back as {t:"pong"} with the same ts).
+          pingTimer = setInterval(() => { try { if (ws.readyState === 1) ws.send(JSON.stringify({ t: "ping", ts: Date.now() })); } catch (e) {} }, 3000);
+          if (pingTimer.unref) pingTimer.unref();
 
           // Remember the creative for this session (validated) so we can re-inject after navigations.
           if (msg.creative) {
