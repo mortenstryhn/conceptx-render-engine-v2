@@ -24,6 +24,7 @@ import express from "express";
 import dns from "node:dns/promises";
 import net from "node:net";
 import os from "node:os";
+import fs from "node:fs";
 import { performance } from "node:perf_hooks";
 import { WebSocketServer } from "ws";
 import { chromium } from "playwright";
@@ -52,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.59-restore-proxy";                                      // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.60-container-cpu";                                      // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -74,19 +75,48 @@ const METRICS = {
   frames: { sent: 0, dropped: 0, bytesSent: 0, peakBufferedKB: 0 },   // cumulative (whole process life)
   _cpuLast: process.cpuUsage(),
   _cpuAt: Date.now(),
+  // Container-wide CPU (captures Chromium too — the render/encode work Node's cpuUsage misses).
+  containerCpuPercentOneCore: null,   // % of ONE core used by the WHOLE container
+  allocatedCores: null,               // CPU cores the container is actually allowed (from cgroup quota)
+  containerCpuPercentOfQuota: null,   // ≈100 = the container is maxing its allocation (throttled)
+  _cgLast: null,
+  _cgAt: Date.now(),
   _win: [],                                        // recent frames: { at, bytes, buffered, sendMs, latMs }
   _rtt: null,                                      // last measured client round-trip (ms), if the client echoes pings
 };
-// CPU% sampler (share of one core; >100 possible if the process uses multiple cores).
+// Read the CONTAINER's cumulative CPU time (microseconds) — cgroup v2 then v1. This includes
+// the Chromium render/encode processes, which process.cpuUsage() (Node only) does not.
+function cgroupCpuUsec() {
+  try { const m = /usage_usec\s+(\d+)/.exec(fs.readFileSync("/sys/fs/cgroup/cpu.stat", "utf8")); if (m) return parseInt(m[1], 10); } catch (e) {}
+  try { return Math.round(parseInt(fs.readFileSync("/sys/fs/cgroup/cpuacct/cpuacct.usage", "utf8").trim(), 10) / 1000); } catch (e) {}
+  return null;
+}
+// How many cores the container is actually allowed (cgroup quota) — v2 cpu.max, then v1.
+function cgroupAllocatedCores() {
+  try { const p = fs.readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim().split(/\s+/); if (p[0] !== "max") { const c = parseInt(p[0], 10) / parseInt(p[1], 10); if (c > 0) return Math.round(c * 100) / 100; } } catch (e) {}
+  try { const q = parseInt(fs.readFileSync("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "utf8").trim(), 10); const per = parseInt(fs.readFileSync("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "utf8").trim(), 10); if (q > 0 && per > 0) return Math.round(q / per * 100) / 100; } catch (e) {}
+  return null;
+}
+METRICS.allocatedCores = cgroupAllocatedCores();
+METRICS._cgLast = cgroupCpuUsec();
+// CPU sampler: Node process CPU% AND container-wide CPU% (the one that includes Chromium).
 setInterval(() => {
   try {
     const now = Date.now();
     const u = process.cpuUsage(METRICS._cpuLast);
     const elapsed = now - METRICS._cpuAt;
-    const cpuMs = (u.user + u.system) / 1000;
-    METRICS.cpuPercent = elapsed > 0 ? Math.round((cpuMs / elapsed) * 100) : 0;
+    METRICS.cpuPercent = elapsed > 0 ? Math.round(((u.user + u.system) / 1000 / elapsed) * 100) : 0;
     METRICS._cpuLast = process.cpuUsage();
     METRICS._cpuAt = now;
+    // container-wide
+    const cg = cgroupCpuUsec();
+    if (cg != null && METRICS._cgLast != null) {
+      const elapsedUs = (now - METRICS._cgAt) * 1000;
+      const pct = elapsedUs > 0 ? Math.round((cg - METRICS._cgLast) / elapsedUs * 100) : 0;
+      METRICS.containerCpuPercentOneCore = pct;
+      if (METRICS.allocatedCores) METRICS.containerCpuPercentOfQuota = Math.round(pct / (METRICS.allocatedCores * 100) * 100);
+    }
+    METRICS._cgLast = cg; METRICS._cgAt = now;
   } catch (e) {}
 }, 2000).unref?.();
 
@@ -1147,8 +1177,11 @@ app.get("/health", (_req, res) => {
     devices: Object.keys(DEVICES),
     // --- instrumentation ("measure first") ---
     uptimeSec: Math.round((Date.now() - METRICS.startedAt) / 1000),
-    cpuPercentOneCore: METRICS.cpuPercent,          // ≈100 = one core pinned (Standard has ~1 core)
-    cores: METRICS.cores,
+    nodeCpuPercentOneCore: METRICS.cpuPercent,      // just the Node relay process (usually tiny)
+    containerCpuPercentOneCore: METRICS.containerCpuPercentOneCore, // WHOLE container incl. Chromium — watch THIS during scroll
+    containerCpuPercentOfQuota: METRICS.containerCpuPercentOfQuota, // ≈100 = container is maxing its CPU allocation (throttled)
+    allocatedCores: METRICS.allocatedCores,         // CPU cores the plan actually gives this container
+    hostCores: METRICS.cores,
     loadAvg1: Math.round((os.loadavg()[0] || 0) * 100) / 100,
     memory: { rssMB: Math.round(mem.rss / 1048576), heapUsedMB: Math.round(mem.heapUsed / 1048576) },
     renders: { active: METRICS.renders.active, queueDepth: queue.length, total: METRICS.renders.total },
