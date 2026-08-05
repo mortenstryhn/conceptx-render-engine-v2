@@ -52,7 +52,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.58-safe-proxy";                                         // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.59-restore-proxy";                                      // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -179,6 +179,7 @@ const DIRECT_CDNS = (process.env.PROXY_DIRECT_CDNS ||
   "fonts.gstatic.com,fonts.googleapis.com,cdnjs.cloudflare.com,jsdelivr.net,unpkg.com,cloudfront.net,akamaihd.net,akamaized.net,akamai.net,fastly.net,imgix.net,cloudinary.com,gstatic.com,ytimg.com"
 ).split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 const PROXY_ALL = (process.env.PROXY_ALL || "false") === "true"; // escape hatch: force everything through the proxy
+const PROXY_SELECTIVE = (process.env.PROXY_SELECTIVE || "false") === "true"; // OFF by default: all traffic via DK relay (reliable ad fill). Set true to re-enable selective routing.
 
 function shouldProxyHost(hostname) {
   const h = (hostname || "").toLowerCase();
@@ -190,7 +191,7 @@ function shouldProxyHost(hostname) {
 }
 
 const proxyInfo = () => PROXY
-  ? { enabled: true, server: PROXY.server, auth: !!PROXY.username, relay: !!relayUrl, selective: !!relayServer, mode: PROXY_ALL ? "all-through" : "third-party-via-DK", firstParty: Array.from(FIRST_PARTY) }
+  ? { enabled: true, server: PROXY.server, auth: !!PROXY.username, relay: !!relayUrl, selective: !!relayServer, mode: (relayServer ? "selective" : "all-through-DK") }
   : { enabled: false };
 if (PROXY) console.log(`Proxy aktiv → ${PROXY.server}${PROXY.username ? " (login via lokal relay)" : ""}`);
 
@@ -208,26 +209,30 @@ async function getBrowser() {
     const upstream = upstreamProxyUrl();
     if (upstream) {
       try {
-        // Selective relay: per request, route ad-tech domains through the DK upstream and
-        // everything else DIRECT. Chromium points at this local server for ALL traffic.
-        const server = new ProxyChain.Server({
-          port: 0,
-          verbose: false,
-          prepareRequestFunction: ({ hostname }) => ({
-            upstreamProxyUrl: shouldProxyHost(hostname) ? upstream : null, // null = go direct
-          }),
-        });
-        await server.listen();
-        relayServer = server;
-        relayUrl = `http://127.0.0.1:${server.port}`;
-        launchProxy = { server: relayUrl };
-        console.log("Selektiv proxy-relay klar → " + relayUrl + " (annonce-domæner via DK, resten direkte)");
+        if (PROXY_SELECTIVE) {
+          // OPT-IN only. Selective relay: route ad-tech through the DK upstream, rest direct.
+          // Off by default because it proved less reliable for ad fill than the all-through relay.
+          const server = new ProxyChain.Server({
+            port: 0, verbose: false,
+            prepareRequestFunction: ({ hostname }) => ({ upstreamProxyUrl: shouldProxyHost(hostname) ? upstream : null }),
+          });
+          await server.listen();
+          relayServer = server;
+          relayUrl = `http://127.0.0.1:${server.port}`;
+          launchProxy = { server: relayUrl };
+          console.log("Selektiv proxy-relay (opt-in) → " + relayUrl);
+        } else {
+          // DEFAULT — the proven, reliable behavior: ALL browser traffic through the DK relay
+          // (this is what filled ads every time). Restored after selective routing hurt fill.
+          relayUrl = await ProxyChain.anonymizeProxy({ url: upstream, port: 0 });
+          launchProxy = { server: relayUrl };
+          console.log("Gennemgående proxy-relay klar → " + relayUrl + " (alt via DK — pålideligt annonce-fyld)");
+        }
       } catch (e) {
-        // Fall back to the simple all-through relay if the selective server can't start.
         try {
           relayUrl = await ProxyChain.anonymizeProxy({ url: upstream, port: 0 });
           launchProxy = { server: relayUrl };
-          console.log("Selektiv relay fejlede, bruger gennemgående relay → " + relayUrl + " (" + (e && e.message || e) + ")");
+          console.log("Relay-fallback → " + relayUrl + " (" + (e && e.message || e) + ")");
         } catch (e2) {
           launchProxy = PROXY;
           console.log("Proxy-relay kunne ikke starte, bruger direkte proxy-login: " + (e2 && e2.message || e2));
@@ -722,10 +727,11 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   // We then REPLACE that real slot with the preview — exactly what the Adnami extension
   // does. Running inside the site's real skin container is what lets the wings paint;
   // a detached top-level <ins> only ever gets the top band, never the side wings.
-  // Quick win: load the Adnami macro context IN PARALLEL with the ad-scroll (they're
-  // independent) instead of sequentially — saves ~1-2s. loadAdnamiContext self-skips if the
-  // site's own engine is already up, so it's safe to run alongside the scroll.
-  const [hasSlot] = await Promise.all([loadPageAds(page), loadAdnamiContext(page)]);
+  // Load the site's ads first, THEN the Adnami macro context (sequential — loadAdnamiContext
+  // self-skips if the site's own engine is already up). Reverted from a parallel version that
+  // risked a double-init race with the site's own engine.
+  const hasSlot = await loadPageAds(page);
+  await loadAdnamiContext(page);
 
   // LIVE tool: "Vis format" for a SKIN with NO chosen placement.
   //  • If the site is ALREADY running a (foreign) skin → auto-replace it in its own slot
@@ -932,7 +938,7 @@ async function placeAdnamiAt(page, creativeCode, x, y, warmed) {
   //    scroll+wait again — this is the big latency saver in the auto-skin flow).
   let spec = { width: 300, height: 240, type: "" };
   try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creativeCode)); } catch (e) { /* defaults */ }
-  if (!warmed) { await Promise.all([loadPageAds(page).catch(() => {}), loadAdnamiContext(page).catch(() => {})]); }
+  if (!warmed) { await loadPageAds(page).catch(() => {}); await loadAdnamiContext(page).catch(() => {}); }
   // Remove ONLY a competing SKIN — topscroll / midscroll / other ads stay untouched.
   if (spec.isSkin) await clearSiteHighImpact(page, creativeCode);
 
