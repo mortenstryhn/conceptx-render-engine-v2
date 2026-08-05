@@ -52,7 +52,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "2", 10);// SMOOTHNESS lever on big viewports: send every Nth frame (higher = lighter CPU, choppier motion; sharpness unaffected)
-const ENGINE_VERSION  = "2.55-instrumented";                                       // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.56-consistent-sharp";                                   // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1526,25 +1526,10 @@ function setupLive(httpServer) {
           const streamMaxW = Math.min(vw, LIVE_MAX_W);
           const streamMaxH = Math.min(vh, LIVE_MAX_H);
           const bigViewport = vw * vh > 1600 * 1000;
-          // ADAPTIVE QUALITY — the key to "sharp AND smooth": stream SHARP (full res, every
-          // frame) when the page is still (what you look at), and drop to a lighter MOTION
-          // profile only WHILE actively scrolling/interacting, then snap back to sharp the
-          // moment you stop. So stills are crisp and motion stays fluid on limited CPU.
-          const sharpParams  = { format: "jpeg", quality: liveQ, everyNthFrame: 1, maxWidth: streamMaxW, maxHeight: streamMaxH };
-          const motionParams = { format: "jpeg", quality: Math.min(liveQ, 55), everyNthFrame: Math.max(2, LIVE_EVERYNTH_BIG), maxWidth: Math.min(streamMaxW, 1280), maxHeight: Math.min(streamMaxH, 800) };
-          await cdp.send("Page.startScreencast", sharpParams);
-          if (bigViewport) {
-            let inMotion = false;
-            const applyStream = async (motion) => {
-              try { await cdp.send("Page.stopScreencast"); } catch (e) {}
-              try { await cdp.send("Page.startScreencast", motion ? motionParams : sharpParams); } catch (e) {}
-            };
-            enterMotion = () => {
-              if (!inMotion) { inMotion = true; applyStream(true); }        // going to motion → lighter
-              if (motionTimer) clearTimeout(motionTimer);
-              motionTimer = setTimeout(() => { inMotion = false; applyStream(false); }, 650); // idle → snap back to sharp
-            };
-          }
+          // SINGLE, CONSISTENT profile — always sharp. (The earlier "adaptive" motion profile
+          // dropped to low-res while scrolling → grainy, and could get stuck there; removed.)
+          const streamEveryNth = bigViewport ? Math.max(1, LIVE_EVERYNTH_BIG) : 1;
+          await cdp.send("Page.startScreencast", { format: "jpeg", quality: liveQ, everyNthFrame: streamEveryNth, maxWidth: streamMaxW, maxHeight: streamMaxH });
           send({ t: "ready", w: vw, h: vh, url });
           // Periodic RTT probe (client should echo {t:"ping"} back as {t:"pong"} with the same ts).
           pingTimer = setInterval(() => { try { if (ws.readyState === 1) ws.send(JSON.stringify({ t: "ping", ts: Date.now() })); } catch (e) {} }, 3000);
