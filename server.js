@@ -51,8 +51,8 @@ const LIVE_QUALITY    = parseInt(process.env.LIVE_QUALITY || "72", 10);      // 
 const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // never stream grainier than this
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
-const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "2", 10);// SMOOTHNESS lever on big viewports: send every Nth frame (higher = lighter CPU, choppier motion; sharpness unaffected)
-const ENGINE_VERSION  = "2.56-consistent-sharp";                                   // bump when deploying; visible at /health
+const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
+const ENGINE_VERSION  = "2.57-fps-unthrottled";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -71,7 +71,7 @@ const METRICS = {
   cores: os.cpus() ? os.cpus().length : 1,
   renders: { total: 0, active: 0, queueDepth: 0 },
   live: { active: 0, total: 0 },
-  frames: { sent: 0, dropped: 0, bytesSent: 0 },   // cumulative
+  frames: { sent: 0, dropped: 0, bytesSent: 0, peakBufferedKB: 0 },   // cumulative (whole process life)
   _cpuLast: process.cpuUsage(),
   _cpuAt: Date.now(),
   _win: [],                                        // recent frames: { at, bytes, buffered, sendMs, latMs }
@@ -94,10 +94,12 @@ function recordFrame({ bytes, sent, buffered, sendMs, latMs }) {
   METRICS.frames.sent += sent ? 1 : 0;
   METRICS.frames.dropped += sent ? 0 : 1;
   METRICS.frames.bytesSent += sent ? (bytes || 0) : 0;
+  const bufKB = Math.round((buffered || 0) / 1024);
+  if (bufKB > METRICS.frames.peakBufferedKB) METRICS.frames.peakBufferedKB = bufKB; // lifetime peak
   const at = Date.now();
   METRICS._win.push({ at, bytes: bytes || 0, buffered: buffered || 0, sendMs: sendMs || 0, latMs: (typeof latMs === "number" ? latMs : null), sent: !!sent });
-  // keep ~last 4 seconds
-  const cutoff = at - 4000;
+  // keep ~last 12 seconds
+  const cutoff = at - 12000;
   while (METRICS._win.length && METRICS._win[0].at < cutoff) METRICS._win.shift();
 }
 function streamStats() {
@@ -1140,7 +1142,15 @@ app.get("/health", (_req, res) => {
     memory: { rssMB: Math.round(mem.rss / 1048576), heapUsedMB: Math.round(mem.heapUsed / 1048576) },
     renders: { active: METRICS.renders.active, queueDepth: queue.length, total: METRICS.renders.total },
     live: { active: METRICS.live.active, total: METRICS.live.total },
-    stream: streamStats(),                          // fps, avgFrameKB, dropRatePct, peakBufferedKB, lastSendMs, frameLatencyMs
+    stream: streamStats(),                          // "right now" (last ~12s): fps, avgFrameKB, dropRatePct, peakBufferedKB, lastSendMs, frameLatencyMs
+    // CUMULATIVE over the whole session — read THESE after scrolling around; no timing needed.
+    framesTotal: {
+      sent: METRICS.frames.sent,
+      dropped: METRICS.frames.dropped,
+      dropRatePct: (METRICS.frames.sent + METRICS.frames.dropped) ? Math.round(METRICS.frames.dropped / (METRICS.frames.sent + METRICS.frames.dropped) * 100) : 0,
+      avgFrameKB: METRICS.frames.sent ? Math.round(METRICS.frames.bytesSent / METRICS.frames.sent / 1024) : 0,
+      peakBufferedKB: METRICS.frames.peakBufferedKB,
+    },
   });
 });
 
