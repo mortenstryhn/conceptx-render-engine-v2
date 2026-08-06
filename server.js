@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.62-auto-login";                                         // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.63-login-robust";                                       // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -790,18 +790,36 @@ async function needsLogin(page) {
 // (first text/email input = username, input[type=password] = password, a submit button / Enter).
 async function autoLogin(page, cfg, send) {
   const passSel = cfg.passSel || 'input[type="password"]';
-  try { await page.waitForSelector(passSel, { timeout: 8000, state: "visible" }); } catch (e) { return false; }
-  const userSel = cfg.userSel || 'input[type="email"], input[autocomplete="username"], input[name*="user" i], input[name*="email" i], input[name*="login" i], input[type="text"]';
+  let passHandle;
+  try { passHandle = await page.waitForSelector(passSel, { timeout: 8000, state: "visible" }); } catch (e) { return false; }
   try {
     if (send) send({ t: "status", msg: "Logger ind…" });
-    await page.fill(userSel, String(cfg.user == null ? "" : cfg.user), { timeout: 5000 });
-    await page.fill(passSel, String(cfg.pass == null ? "" : cfg.pass), { timeout: 5000 });
+    // Username field: explicit selector if given, else the visible non-password input nearest
+    // BEFORE the password in the same form (robust across almost any login layout).
+    let userHandle = null;
+    if (cfg.userSel) userHandle = await page.$(cfg.userSel).catch(() => null);
+    if (!userHandle) {
+      const js = await page.evaluateHandle((pass) => {
+        const scope = pass.closest("form") || document;
+        const all = Array.from(scope.querySelectorAll("input"));
+        const bad = ["password", "hidden", "submit", "button", "checkbox", "radio", "file", "image", "reset"];
+        const visible = (i) => !!(i.offsetParent || (i.getClientRects && i.getClientRects().length));
+        const cand = all.filter((i) => visible(i) && !bad.includes((i.getAttribute("type") || "text").toLowerCase()));
+        const pIdx = all.indexOf(pass);
+        const before = cand.filter((i) => all.indexOf(i) < pIdx);
+        return before.length ? before[before.length - 1] : (cand[0] || null);
+      }, passHandle);
+      userHandle = js && js.asElement ? js.asElement() : null;
+    }
+    if (!userHandle) { if (send) send({ t: "notice", msg: "Fandt ikke brugernavn-feltet — angiv 'userSel' i SITE_LOGINS." }); return false; }
+    await userHandle.fill(String(cfg.user == null ? "" : cfg.user));
+    await passHandle.fill(String(cfg.pass == null ? "" : cfg.pass));
     if (cfg.submitSel) {
       await page.click(cfg.submitSel, { timeout: 5000 }).catch(() => {});
     } else {
-      const btn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Log ind"), button:has-text("Logga in"), button:has-text("Login"), button:has-text("Log in"), button:has-text("Sign in")').first();
+      const btn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Log ind"), button:has-text("Logga in"), button:has-text("Logga"), button:has-text("Login"), button:has-text("Log in"), button:has-text("Sign in")').first();
       if (await btn.count().catch(() => 0)) await btn.click({ timeout: 5000 }).catch(() => {});
-      else await page.press(passSel, "Enter").catch(() => {});
+      else await passHandle.press("Enter").catch(() => {});
     }
     await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
     return true;
