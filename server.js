@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.63-login-robust";                                       // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.64-login-consent-order";                                // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -416,9 +416,14 @@ async function assertSafeUrl(raw) {
  * Consent-banner dismissal (best effort, covers common CMPs)         *
  * ------------------------------------------------------------------ */
 const CONSENT_TEXT = [
+  // Danish
   "Accepter alle", "Accepter alle cookies", "Tillad alle", "Accepter alle og luk",
   "Accepter", "Godkend alle", "Jeg accepterer", "Enig", "Accepter og luk",
-  "Accept all", "Accept All", "Allow all", "I accept", "Agree", "Accept & close",
+  // Swedish (mingolf.golf.se etc.)
+  "Acceptera alla", "Acceptera alla cookies", "Acceptera", "Godkänn alla", "Godkänn",
+  "Tillåt alla", "Jag accepterar", "Tillåt alla cookies", "Acceptera och stäng",
+  // English
+  "Accept all", "Accept All", "Allow all", "I accept", "Agree", "Accept & close", "Allow cookies",
 ];
 const CONSENT_SELECTORS = [
   "#onetrust-accept-btn-handler",
@@ -830,10 +835,18 @@ async function autoLogin(page, cfg, send) {
 async function ensureLoggedIn(page, url, context, send) {
   const cfg = getLogin(url);
   if (!cfg) return false;                          // domain not configured → do nothing
-  if (!(await needsLogin(page))) return false;     // already logged in (cached session worked)
+  // Cookie consent FIRST — the login wall often needs consent before the form works, and
+  // accepting it can RELOAD the page (which would otherwise wipe a premature login).
+  await giveConsent(page).catch(() => {});
+  await page.waitForTimeout(600);
+  if (!(await needsLogin(page))) {                 // already logged in (cached session worked)
+    try { SESSION_CACHE.set(hostKey(url), await context.storageState()); } catch (e) {} // refresh cache (now incl. consent cookie)
+    return false;
+  }
   const ok = await autoLogin(page, cfg, send);
   if (ok) {
-    try { SESSION_CACHE.set(hostKey(url), await context.storageState()); } catch (e) {}
+    await giveConsent(page).catch(() => {});       // accept consent again on the post-login page (for ads)
+    try { SESSION_CACHE.set(hostKey(url), await context.storageState()); } catch (e) {} // cache cookies+consent so it's reused next time
     await robustGoto(page, url, send);             // back to the intended page, now signed in
     if (send) send({ t: "notice", msg: "Logget ind ✓" });
   }
