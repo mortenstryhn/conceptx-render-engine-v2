@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.60-container-cpu";                                      // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.61-cpu-peak";                                           // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -76,7 +76,9 @@ const METRICS = {
   _cpuLast: process.cpuUsage(),
   _cpuAt: Date.now(),
   // Container-wide CPU (captures Chromium too — the render/encode work Node's cpuUsage misses).
-  containerCpuPercentOneCore: null,   // % of ONE core used by the WHOLE container
+  containerCpuPercentOneCore: null,   // % of ONE core used by the WHOLE container (right now)
+  peakContainerCpuPercentOneCore: 0,  // highest value seen this session — scroll, then read THIS
+  peakContainerCpuPercentOfQuota: 0,  // same as % of the allocated CPU (≈100 = was maxed → CPU-bound)
   allocatedCores: null,               // CPU cores the container is actually allowed (from cgroup quota)
   containerCpuPercentOfQuota: null,   // ≈100 = the container is maxing its allocation (throttled)
   _cgLast: null,
@@ -114,7 +116,12 @@ setInterval(() => {
       const elapsedUs = (now - METRICS._cgAt) * 1000;
       const pct = elapsedUs > 0 ? Math.round((cg - METRICS._cgLast) / elapsedUs * 100) : 0;
       METRICS.containerCpuPercentOneCore = pct;
-      if (METRICS.allocatedCores) METRICS.containerCpuPercentOfQuota = Math.round(pct / (METRICS.allocatedCores * 100) * 100);
+      if (pct > METRICS.peakContainerCpuPercentOneCore) METRICS.peakContainerCpuPercentOneCore = pct;
+      if (METRICS.allocatedCores) {
+        const ofQuota = Math.round(pct / (METRICS.allocatedCores * 100) * 100);
+        METRICS.containerCpuPercentOfQuota = ofQuota;
+        if (ofQuota > METRICS.peakContainerCpuPercentOfQuota) METRICS.peakContainerCpuPercentOfQuota = ofQuota;
+      }
     }
     METRICS._cgLast = cg; METRICS._cgAt = now;
   } catch (e) {}
@@ -1178,7 +1185,9 @@ app.get("/health", (_req, res) => {
     // --- instrumentation ("measure first") ---
     uptimeSec: Math.round((Date.now() - METRICS.startedAt) / 1000),
     nodeCpuPercentOneCore: METRICS.cpuPercent,      // just the Node relay process (usually tiny)
-    containerCpuPercentOneCore: METRICS.containerCpuPercentOneCore, // WHOLE container incl. Chromium — watch THIS during scroll
+    containerCpuPercentOneCore: METRICS.containerCpuPercentOneCore, // WHOLE container incl. Chromium (right now)
+    peakContainerCpuPercentOneCore: METRICS.peakContainerCpuPercentOneCore, // ← scroll ~20s, then read THIS (highest seen)
+    peakContainerCpuPercentOfQuota: METRICS.peakContainerCpuPercentOfQuota, // ≈100 = container maxed its CPU allocation → CPU-bound
     containerCpuPercentOfQuota: METRICS.containerCpuPercentOfQuota, // ≈100 = container is maxing its CPU allocation (throttled)
     allocatedCores: METRICS.allocatedCores,         // CPU cores the plan actually gives this container
     hostCores: METRICS.cores,
