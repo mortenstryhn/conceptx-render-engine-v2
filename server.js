@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.64-login-consent-order";                                // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.65-login-no-reload";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -845,9 +845,12 @@ async function ensureLoggedIn(page, url, context, send) {
   }
   const ok = await autoLogin(page, cfg, send);
   if (ok) {
-    await giveConsent(page).catch(() => {});       // accept consent again on the post-login page (for ads)
+    // autoLogin's submit already redirected us to the signed-in page. DON'T navigate back to
+    // `url` — that URL is the /login page, so re-loading it would sign us straight back out.
+    // Only if we somehow ended up back on a login page do we retry once.
+    if (await needsLogin(page)) await robustGoto(page, url, send).catch(() => {});
+    await giveConsent(page).catch(() => {});       // accept consent on the post-login page (for ads)
     try { SESSION_CACHE.set(hostKey(url), await context.storageState()); } catch (e) {} // cache cookies+consent so it's reused next time
-    await robustGoto(page, url, send);             // back to the intended page, now signed in
     if (send) send({ t: "notice", msg: "Logget ind ✓" });
   }
   return ok;
