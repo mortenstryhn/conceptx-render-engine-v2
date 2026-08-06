@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.66-session-consent-cache";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.67-session-consent-live";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1582,6 +1582,7 @@ function setupLive(httpServer) {
     let manualConsent = false;
     let motionTimer = null;            // adaptive stream: revert-to-sharp timer
     let pingTimer = null;              // RTT probe (client echoes {t:"ping"} → {t:"pong"})
+    let stateTimer = null;             // periodic cookies+consent snapshot → survives device/setting switch
     let enterMotion = () => {};        // set up once the screencast is running
     let liveCreative = "", livePlacement = ""; // Adnami creative kept for re-injection after nav/reload
     let liveUrl = ""; // last good URL, so "reload" recovers even from a chrome-error tab
@@ -1615,17 +1616,21 @@ function setupLive(httpServer) {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => { send({ t: "error", msg: "Sessionen blev lukket pga. inaktivitet." }); cleanup(); }, LIVE_IDLE_MS);
     };
+    // Persist this host's cookies+consent so a fresh context (device/setting switch) reuses it
+    // instead of re-prompting the cookie box. Reset via /clear-session ("Ryd session").
+    const saveSession = async () => {
+      try { if (context && liveUrl) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState()); } catch {}
+    };
     const cleanup = async () => {
       if (closed) return; closed = true;
       if (idleTimer) clearTimeout(idleTimer);
       if (motionTimer) clearTimeout(motionTimer);
       if (pingTimer) clearInterval(pingTimer);
+      if (stateTimer) clearInterval(stateTimer);
       liveCount = Math.max(0, liveCount - 1);
       METRICS.live.active = Math.max(0, METRICS.live.active - 1);
       try { if (cdp) await cdp.detach(); } catch {}
-      // Persist this host's session (cookies + consent) so a device/setting change doesn't
-      // force the user to re-accept the cookie box. Reset via /clear-session ("Ryd session").
-      try { if (context && liveUrl) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState()); } catch {}
+      await saveSession();
       try { if (context) await context.close(); } catch {}
       try { ws.close(); } catch {}
     };
@@ -1685,7 +1690,7 @@ function setupLive(httpServer) {
               if (nu && nu !== "about:blank") { await page.goto(nu, { waitUntil: "domcontentloaded" }); if (!manualConsent) await dismissConsent(page); }
             } catch { try { await pg.close(); } catch {} }
           });
-          page.on("framenavigated", (fr) => { if (fr === page.mainFrame()) send({ t: "url", url: page.url() }); });
+          page.on("framenavigated", (fr) => { if (fr === page.mainFrame()) { send({ t: "url", url: page.url() }); saveSession(); } });
 
           cdp = await context.newCDPSession(page);
           cdp.on("Page.screencastFrame", async (f) => {
@@ -1719,6 +1724,10 @@ function setupLive(httpServer) {
           // Periodic RTT probe (client should echo {t:"ping"} back as {t:"pong"} with the same ts).
           pingTimer = setInterval(() => { try { if (ws.readyState === 1) ws.send(JSON.stringify({ t: "ping", ts: Date.now() })); } catch (e) {} }, 3000);
           if (pingTimer.unref) pingTimer.unref();
+          // Snapshot cookies+consent every few seconds while surfing, so a device/setting switch
+          // (which opens a brand-new context) reuses the consent instead of re-prompting.
+          stateTimer = setInterval(saveSession, 4000);
+          if (stateTimer.unref) stateTimer.unref();
 
           // Remember the creative for this session (validated) so we can re-inject after navigations.
           if (msg.creative) {
