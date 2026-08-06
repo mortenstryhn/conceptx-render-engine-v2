@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.61-cpu-peak";                                           // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.62-auto-login";                                         // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -231,6 +231,33 @@ const proxyInfo = () => PROXY
   ? { enabled: true, server: PROXY.server, auth: !!PROXY.username, relay: !!relayUrl, selective: !!relayServer, mode: (relayServer ? "selective" : "all-through-DK") }
   : { enabled: false };
 if (PROXY) console.log(`Proxy aktiv → ${PROXY.server}${PROXY.username ? " (login via lokal relay)" : ""}`);
+
+/* ------------------------------------------------------------------ *
+ * AUTO-LOGIN (opt-in per domain) — for sites that require sign-in to *
+ * show ads. Config lives in the SITE_LOGINS env var (a Render secret,*
+ * so it SURVIVES DEPLOYS and is never in the code/GitHub). Only the  *
+ * listed domains get auto-login; every other site is untouched.      *
+ *                                                                    *
+ * SITE_LOGINS = JSON array, e.g.:                                    *
+ * [{"domain":"mingolf.golf.se","user":"NAME","pass":"SECRET",        *
+ *   "userSel":"#username","passSel":"#password",                     *
+ *   "submitSel":"button[type=submit]"}]                             *
+ * userSel/passSel/submitSel are OPTIONAL — a generic form heuristic  *
+ * is used when they're absent.                                       *
+ * ------------------------------------------------------------------ */
+let SITE_LOGINS = [];
+try { if (process.env.SITE_LOGINS) SITE_LOGINS = JSON.parse(process.env.SITE_LOGINS) || []; }
+catch (e) { console.log("SITE_LOGINS kunne ikke parses som JSON — auto-login er slået fra:", e && e.message || e); }
+if (!Array.isArray(SITE_LOGINS)) SITE_LOGINS = [];
+function getLogin(url) {
+  let host = ""; try { host = new URL(url).hostname.toLowerCase(); } catch { return null; }
+  return SITE_LOGINS.find((c) => c && c.domain && (host === String(c.domain).toLowerCase() || host.endsWith("." + String(c.domain).toLowerCase()))) || null;
+}
+// Cached logged-in sessions (cookies + storage) per hostname — reused across refreshes /
+// device switches / new sessions so a sign-in happens once, then re-runs itself automatically
+// (from the env-stored credentials) after a deploy wipes the in-memory cache.
+const SESSION_CACHE = new Map();
+function hostKey(url) { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
 
 const app = express();
 app.disable("x-powered-by");
@@ -750,6 +777,49 @@ async function robustGoto(page, url, send) {
     }
   }
   return false;
+}
+
+// Is the page currently on a sign-in wall? (URL looks like login, or a password field is shown.)
+async function needsLogin(page) {
+  try {
+    if (/\/login|\/signin|\/log-in|\/auth|\/logga-in|\/logind|\/sign-in/i.test(page.url())) return true;
+    return await page.evaluate(() => !!document.querySelector('input[type="password"]')).catch(() => false);
+  } catch (e) { return false; }
+}
+// Fill + submit the login form. Uses the config's selectors if given, else a generic heuristic
+// (first text/email input = username, input[type=password] = password, a submit button / Enter).
+async function autoLogin(page, cfg, send) {
+  const passSel = cfg.passSel || 'input[type="password"]';
+  try { await page.waitForSelector(passSel, { timeout: 8000, state: "visible" }); } catch (e) { return false; }
+  const userSel = cfg.userSel || 'input[type="email"], input[autocomplete="username"], input[name*="user" i], input[name*="email" i], input[name*="login" i], input[type="text"]';
+  try {
+    if (send) send({ t: "status", msg: "Logger ind…" });
+    await page.fill(userSel, String(cfg.user == null ? "" : cfg.user), { timeout: 5000 });
+    await page.fill(passSel, String(cfg.pass == null ? "" : cfg.pass), { timeout: 5000 });
+    if (cfg.submitSel) {
+      await page.click(cfg.submitSel, { timeout: 5000 }).catch(() => {});
+    } else {
+      const btn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Log ind"), button:has-text("Logga in"), button:has-text("Login"), button:has-text("Log in"), button:has-text("Sign in")').first();
+      if (await btn.count().catch(() => 0)) await btn.click({ timeout: 5000 }).catch(() => {});
+      else await page.press(passSel, "Enter").catch(() => {});
+    }
+    await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+    return true;
+  } catch (e) { if (send) send({ t: "notice", msg: "Auto-login fejlede: " + String(e && e.message || e) }); return false; }
+}
+// Ensure the page is logged in for a configured site: reuse a cached session, else auto-login
+// with the env-stored credentials and cache the resulting session. Returns true if we logged in.
+async function ensureLoggedIn(page, url, context, send) {
+  const cfg = getLogin(url);
+  if (!cfg) return false;                          // domain not configured → do nothing
+  if (!(await needsLogin(page))) return false;     // already logged in (cached session worked)
+  const ok = await autoLogin(page, cfg, send);
+  if (ok) {
+    try { SESSION_CACHE.set(hostKey(url), await context.storageState()); } catch (e) {}
+    await robustGoto(page, url, send);             // back to the intended page, now signed in
+    if (send) send({ t: "notice", msg: "Logget ind ✓" });
+  }
+  return ok;
 }
 
 async function injectAdnami(page, creativeCode, placement, preSpec) {
@@ -1542,11 +1612,15 @@ function setupLive(httpServer) {
           liveUrl = url; registerFirstParty(url);
 
           send({ t: "status", msg: "Åbner side…" });
+          // Reuse a cached logged-in session for this host (if we have one) so refresh / device
+          // switch keeps you signed in without re-entering anything.
+          const cachedState = SESSION_CACHE.get(hostKey(url));
           context = await (await getBrowser()).newContext({
             viewport: { width: vw, height: vh },
             deviceScaleFactor: liveDsf,
             isMobile: dev.mobile, hasTouch: dev.mobile, userAgent: dev.ua,
             locale: LOCALE, timezoneId: TIMEZONE, ignoreHTTPSErrors: true,
+            ...(cachedState ? { storageState: cachedState } : {}),
           });
           if (BLOCK_MEDIA) {
             await context.route("**/*", (r) =>
@@ -1608,6 +1682,8 @@ function setupLive(httpServer) {
           // Robust navigation (retries + verifies it didn't land on chrome-error).
           const navOk = await robustGoto(page, url, send);
           if (!navOk) send({ t: "notice", msg: "Kunne ikke hente siden gennem proxy'en efter flere forsøg. Tryk genindlæs, eller prøv igen om lidt." });
+          // Auto sign-in for configured login sites (no-op for everything else).
+          await ensureLoggedIn(page, url, context, send).catch(() => {});
           if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); }
           await doInject();
         }
@@ -1637,10 +1713,10 @@ function setupLive(httpServer) {
               else if (msg.action === "forward") await page.goForward({ waitUntil: "domcontentloaded" }).catch(() => {});
               else if (msg.action === "reload") {
                 let target = page.url(); if (!target || target.startsWith("chrome-error") || target === "about:blank") target = liveUrl;
-                if (target) { await robustGoto(page, target, send); if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); } await doInject(); }
+                if (target) { await robustGoto(page, target, send); await ensureLoggedIn(page, target, context, send).catch(() => {}); if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); } await doInject(); }
               }
               else if (msg.action === "goto" && msg.url) {
-                try { const su = await assertSafeUrl(msg.url); liveUrl = su; registerFirstParty(su); await robustGoto(page, su, send); if (!manualConsent) await dismissConsent(page); await doInject(); }
+                try { const su = await assertSafeUrl(msg.url); liveUrl = su; registerFirstParty(su); await robustGoto(page, su, send); await ensureLoggedIn(page, su, context, send).catch(() => {}); if (!manualConsent) await dismissConsent(page); await doInject(); }
                 catch (e) { send({ t: "error", msg: e.message }); }
               }
             }
