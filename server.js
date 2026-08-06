@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.65-login-no-reload";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.66-session-consent-cache";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1311,6 +1311,16 @@ app.get("/health", (_req, res) => {
   });
 });
 
+// Clear the cached session (cookies + consent) for one host — powers the frontend's
+// "Ryd session". Consent is re-asked on the next preview; login sites simply auto-login again.
+app.get("/clear-session", (req, res) => {
+  if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) return res.status(401).json({ error: "Ugyldig token" });
+  const host = hostKey(req.query.url || "") || String(req.query.host || "").toLowerCase().trim();
+  if (!host) return res.status(400).json({ error: "Mangler url/host" });
+  const cleared = SESSION_CACHE.delete(host);
+  res.json({ ok: true, host, cleared });
+});
+
 // Confirm the OUTBOUND IP the browser actually uses. Open this (with ?token=…) after
 // setting PROXY_URL to verify you now have a Danish IP: it loads an IP-echo service
 // THROUGH the browser (so it reflects the proxy) and returns country/city/org.
@@ -1613,6 +1623,9 @@ function setupLive(httpServer) {
       liveCount = Math.max(0, liveCount - 1);
       METRICS.live.active = Math.max(0, METRICS.live.active - 1);
       try { if (cdp) await cdp.detach(); } catch {}
+      // Persist this host's session (cookies + consent) so a device/setting change doesn't
+      // force the user to re-accept the cookie box. Reset via /clear-session ("Ryd session").
+      try { if (context && liveUrl) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState()); } catch {}
       try { if (context) await context.close(); } catch {}
       try { ws.close(); } catch {}
     };
