@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.67-session-consent-live";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.68-smoothness";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -311,8 +311,15 @@ async function getBrowser() {
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
         "--disable-gpu",
+        // Keep the headless (effectively "hidden") page rendering at full speed. Otherwise Chromium
+        // throttles its timers / requestAnimationFrame / compositor for the backgrounded page — which
+        // is exactly what shows up as scroll-jank in the live desktop stream. Safe; no feature impact.
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-ipc-flooding-protection",
         // Share one process across cross-origin iframes (ad slots) → big memory saving on ad-heavy pages.
-        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-features=IsolateOrigins,site-per-process,CalculateNativeWinOcclusion",
         "--disable-site-isolation-trials",
       ],
     });
