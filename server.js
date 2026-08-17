@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.75-showformat-inplace";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.76-revert-topscroll";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -904,15 +904,9 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   //  • If NO skin is running → do NOT auto-inject (injecting a skin at <body> is wrong and
   //    disturbs the page). Leave the real ads and let the user point the crosshair.
   if (!placement) {
-    const kw = formatKeyword(spec);
-    // TOPSCROLL / INTERSCROLL are top-anchored takeovers: the Adnami engine escapes to the top of
-    // the page by itself, so we inject at <body> directly — site-agnostic (no slot name, no user
-    // placement). Verified via /adnm-inspect: the engine builds the full adnm-html-topscroll from body.
-    if (kw === "topscroll" || kw === "interscroll") {
-      placement = "body";
-    } else {
     // AUTO-REPLACE: find a RUNNING ad of the SAME format as our creative and swap it in place.
     // Matched via Adnami's own format id (data-adnm-fid) — site-agnostic, no slot names.
+    const kw = formatKeyword(spec);
     const info = await page.evaluate(({ ourCc, kw, isSkin }) => {
       const R = (el) => { const r = el.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.left), y: Math.round(r.top) }; };
       const all = Array.from(document.querySelectorAll("[data-adnm-fid]"));
@@ -965,7 +959,6 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
     }
     // No matching running ad → show the real ads and let the user point the crosshair.
     return { ok: true, mounted: false, needsPlacement: true, hasSlot, isSkin: !!spec.isSkin, kw, marks: (info && info.marks) || {}, formatName: spec.formatName };
-    }
   }
 
   // For a SKIN, clear the site's OWN competing skin first (once) — otherwise the site's
