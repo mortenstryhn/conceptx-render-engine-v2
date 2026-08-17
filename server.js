@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.76-revert-topscroll";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.77-topscroll-isolated";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -879,6 +879,21 @@ async function ensureLoggedIn(page, url, context, send) {
   return ok;
 }
 
+// Remove a previously-built topscroll takeover so the page is restored (the engine's own
+// adnm-html-topscroll-* nodes and the class/height it puts on <html> are NOT data-cx-injected,
+// so the normal cleanup misses them). Keeps a topscroll from ever leaving the page broken.
+async function clearTopscroll(page) {
+  await page.evaluate(() => {
+    try {
+      document.querySelectorAll('[class*="adnm-html-topscroll" i]').forEach((n) => n.remove());
+      const html = document.documentElement;
+      Array.from(html.classList).forEach((c) => { if (/adnm-topscroll/i.test(c)) html.classList.remove(c); });
+      html.style.height = ""; html.style.overflow = "";
+      if (document.body) { document.body.style.height = ""; document.body.style.marginTop = ""; }
+    } catch (e) {}
+  }).catch(() => {});
+}
+
 async function injectAdnami(page, creativeCode, placement, preSpec) {
   let spec = preSpec || { width: 300, height: 240, type: "" };
   let fetchNote = "";
@@ -896,6 +911,50 @@ async function injectAdnami(page, creativeCode, placement, preSpec) {
   // risked a double-init race with the site's own engine.
   const hasSlot = await loadPageAds(page);
   await loadAdnamiContext(page);
+
+  // ── ISOLATED TOPSCROLL / INTERSCROLL PATH ───────────────────────────────────────────────
+  // A topscroll is a top-anchored TAKEOVER: given the tag, Adnami's engine escapes to the top of
+  // the page and builds it there itself. We inject at <body> (site-agnostic — no slot names) in a
+  // fully self-contained branch that RETURNS immediately, so it can NEVER touch the skin/midscroll/
+  // banner logic below or the site's own ads. clearTopscroll() first removes any earlier takeover.
+  if (["topscroll", "interscroll"].includes(formatKeyword(spec))) {
+    await clearTopscroll(page);
+    const r = await page.evaluate(({ creativeCode, spec, engineSrc }) => {
+      try {
+        document.querySelectorAll("[data-cx-injected]").forEach((n) => n.remove());
+        const ins = document.createElement("ins");
+        ins.className = "adnm-tag";
+        ins.style.cssText = `display:inline-block;width:${spec.width || 1}px;height:${spec.height || 2}px`;
+        ins.setAttribute("data-adnm-cc", creativeCode);
+        if (spec.type) ins.setAttribute("data-adnm-type", spec.type);
+        ins.setAttribute("data-adnm-click", "");
+        ins.setAttribute("data-cx-injected", "");
+        const wrap = document.createElement("div"); wrap.setAttribute("data-cx-injected", ""); wrap.style.cssText = "display:block";
+        wrap.appendChild(ins);
+        if (document.body.firstChild) document.body.insertBefore(wrap, document.body.firstChild); else document.body.appendChild(wrap);
+        const s = document.createElement("script"); s.async = true; s.type = "text/javascript"; s.src = engineSrc; ins.appendChild(s);
+        return { ok: true };
+      } catch (e) { return { ok: false, reason: String(e && e.message || e) }; }
+    }, { creativeCode, spec, engineSrc: ADNAMI_ENGINE_SRC });
+    if (!r || !r.ok) throw new Error("Kunne ikke indsætte topscroll" + (r && r.reason ? " (" + r.reason + ")" : ""));
+    let mounted = false, ours = false;
+    for (let i = 0; i < 16; i++) {
+      await page.waitForTimeout(500);
+      const d = await page.evaluate((cc) => {
+        cc = (cc || "").toLowerCase();
+        let present = false, rendered = false;
+        document.querySelectorAll("[data-adnm-cc]").forEach((el) => {
+          if ((el.getAttribute("data-adnm-cc") || "").toLowerCase() === cc) { present = true; if (el.querySelector("iframe") || /adnm-html-topscroll/i.test(el.className || "")) rendered = true; }
+        });
+        if (document.querySelector('[class*="adnm-html-topscroll" i] iframe')) rendered = true;
+        return { present, rendered };
+      }, creativeCode).catch(() => ({ present: false, rendered: false }));
+      mounted = d.rendered || d.present; ours = d.rendered;
+      if (d.rendered) break;
+    }
+    return { ok: true, mounted, ours, method: "topscroll-body", isSkin: false, hasSlot };
+  }
+  // ────────────────────────────────────────────────────────────────────────────────────────
 
   // LIVE tool: "Vis format" for a SKIN with NO chosen placement.
   //  • If the site is ALREADY running a (foreign) skin → auto-replace it in its own slot
