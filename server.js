@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.77-topscroll-isolated";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.78-remember-consent";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1732,7 +1732,7 @@ function setupLive(httpServer) {
     const saveSession = async () => {
       // Only login sites need a persisted session. Caching consent for normal sites caused a
       // stale/partial consent cookie to be replayed → CMP suppressed + ads blocked. Skip them.
-      try { if (context && liveUrl && getLogin(liveUrl)) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState()); } catch {}
+      try { if (context && liveUrl) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState()); } catch {}
     };
     const cleanup = async () => {
       if (closed) return; closed = true;
@@ -1779,7 +1779,7 @@ function setupLive(httpServer) {
           send({ t: "status", msg: "Åbner side…" });
           // Reuse a cached logged-in session for this host (if we have one) so refresh / device
           // switch keeps you signed in without re-entering anything.
-          const cachedState = getLogin(url) ? SESSION_CACHE.get(hostKey(url)) : undefined;   // only reuse cache on login sites
+          const cachedState = SESSION_CACHE.get(hostKey(url));   // reuse this host's session (cookies+consent) across URLs/settings
           context = await (await getBrowser()).newContext({
             viewport: { width: vw, height: vh },
             deviceScaleFactor: liveDsf,
