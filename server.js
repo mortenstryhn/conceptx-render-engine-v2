@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.70-warm-login";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.71-consent-ads-fix";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1642,7 +1642,9 @@ function setupLive(httpServer) {
     // Persist this host's cookies+consent so a fresh context (device/setting switch) reuses it
     // instead of re-prompting the cookie box. Reset via /clear-session ("Ryd session").
     const saveSession = async () => {
-      try { if (context && liveUrl) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState()); } catch {}
+      // Only login sites need a persisted session. Caching consent for normal sites caused a
+      // stale/partial consent cookie to be replayed → CMP suppressed + ads blocked. Skip them.
+      try { if (context && liveUrl && getLogin(liveUrl)) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState()); } catch {}
     };
     const cleanup = async () => {
       if (closed) return; closed = true;
@@ -1689,7 +1691,7 @@ function setupLive(httpServer) {
           send({ t: "status", msg: "Åbner side…" });
           // Reuse a cached logged-in session for this host (if we have one) so refresh / device
           // switch keeps you signed in without re-entering anything.
-          const cachedState = SESSION_CACHE.get(hostKey(url));
+          const cachedState = getLogin(url) ? SESSION_CACHE.get(hostKey(url)) : undefined;   // only reuse cache on login sites
           context = await (await getBrowser()).newContext({
             viewport: { width: vw, height: vh },
             deviceScaleFactor: liveDsf,
@@ -1710,7 +1712,7 @@ function setupLive(httpServer) {
               await pg.waitForLoadState("domcontentloaded", { timeout: 6000 });
               const nu = pg.url();
               await pg.close();
-              if (nu && nu !== "about:blank") { await page.goto(nu, { waitUntil: "domcontentloaded" }); if (!manualConsent) await dismissConsent(page); }
+              if (nu && nu !== "about:blank") { await page.goto(nu, { waitUntil: "domcontentloaded" }); if (!manualConsent) await giveConsent(page); }
             } catch { try { await pg.close(); } catch {} }
           });
           page.on("framenavigated", (fr) => { if (fr === page.mainFrame()) { send({ t: "url", url: page.url() }); saveSession(); } });
@@ -1763,7 +1765,7 @@ function setupLive(httpServer) {
           if (!navOk) send({ t: "notice", msg: "Kunne ikke hente siden gennem proxy'en efter flere forsøg. Tryk genindlæs, eller prøv igen om lidt." });
           // Auto sign-in for configured login sites (no-op for everything else).
           await ensureLoggedIn(page, url, context, send).catch(() => {});
-          if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); }
+          if (!manualConsent) await giveConsent(page);
           await doInject();
         }
         else if (!page) { return; }
@@ -1792,10 +1794,10 @@ function setupLive(httpServer) {
               else if (msg.action === "forward") await page.goForward({ waitUntil: "domcontentloaded" }).catch(() => {});
               else if (msg.action === "reload") {
                 let target = page.url(); if (!target || target.startsWith("chrome-error") || target === "about:blank") target = liveUrl;
-                if (target) { await robustGoto(page, target, send); await ensureLoggedIn(page, target, context, send).catch(() => {}); if (!manualConsent) { if (liveCreative) await giveConsent(page); else await dismissConsent(page); } await doInject(); }
+                if (target) { await robustGoto(page, target, send); await ensureLoggedIn(page, target, context, send).catch(() => {}); if (!manualConsent) await giveConsent(page); await doInject(); }
               }
               else if (msg.action === "goto" && msg.url) {
-                try { const su = await assertSafeUrl(msg.url); liveUrl = su; registerFirstParty(su); await robustGoto(page, su, send); await ensureLoggedIn(page, su, context, send).catch(() => {}); if (!manualConsent) await dismissConsent(page); await doInject(); }
+                try { const su = await assertSafeUrl(msg.url); liveUrl = su; registerFirstParty(su); await robustGoto(page, su, send); await ensureLoggedIn(page, su, context, send).catch(() => {}); if (!manualConsent) await giveConsent(page); await doInject(); }
                 catch (e) { send({ t: "error", msg: e.message }); }
               }
             }
