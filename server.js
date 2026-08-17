@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.74-topscroll";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.75-showformat-inplace";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1836,6 +1836,14 @@ function setupLive(httpServer) {
                 try { const su = await assertSafeUrl(msg.url); liveUrl = su; registerFirstParty(su); await robustGoto(page, su, send); await ensureLoggedIn(page, su, context, send).catch(() => {}); if (!manualConsent) await giveConsent(page); await doInject(); }
                 catch (e) { send({ t: "error", msg: e.message }); }
               }
+            }
+            else if (msg.t === "showFormat") {
+              // Inject the creative on the ALREADY-LOADED page (no reload) so cookies/consent are
+              // preserved — repeated "Vis format" from the same site never re-prompts the cookie box.
+              try { liveCreative = msg.creative ? normalizeCreative(msg.creative) : ""; livePlacement = ""; }
+              catch (e) { send({ t: "notice", msg: e.message }); return; }
+              if (!liveCreative) { send({ t: "notice", msg: "Intet creative-ID." }); return; }
+              await doInject();
             }
             else if (msg.t === "pick") {
               if (!liveCreative) { send({ t: "notice", msg: "Indsæt et creative-ID og tryk Vis format først." }); return; }
