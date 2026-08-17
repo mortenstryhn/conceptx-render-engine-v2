@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.79-ads-on-navigation";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.80-consent-once";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -260,8 +260,22 @@ function getLogin(url) {
 // Cached logged-in sessions (cookies + storage) per hostname — reused across refreshes /
 // device switches / new sessions so a sign-in happens once, then re-runs itself automatically
 // (from the env-stored credentials) after a deploy wipes the in-memory cache.
-const SESSION_CACHE = new Map();
+const SESSION_CACHE = new Map();          // full session state — LOGIN sites only (keeps you signed in)
+const CONSENT_CACHE = new Map();          // ONLY the consent cookie(s) per host — "accept once, remember forever"
+// Cookies the major consent tools set once you've accepted (Cookiebot, Cookie Information, TCF,
+// OneTrust, Didomi, Usercentrics, Sourcepoint, Complianz…). We remember ONLY these — never the
+// ad-state — so consent sticks across visits WITHOUT the stale ad cookies that blocked ad fill.
+const CONSENT_COOKIE_RE = /(consent|cookiebot|cookieinformation|didomi|usercentrics|optanon|^_sp_|sp_consent|cmplz|cookielawinfo|borlabs|euconsent|eupubconsent)/i;
 function hostKey(url) { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
+async function rememberConsent(context, url) {
+  try { const host = hostKey(url); if (!host) return;
+    const consent = (await context.cookies()).filter((c) => CONSENT_COOKIE_RE.test(c.name));
+    if (consent.length) CONSENT_CACHE.set(host, consent);
+  } catch (e) {}
+}
+async function seedConsent(context, url) {
+  try { const c = CONSENT_CACHE.get(hostKey(url)); if (c && c.length) await context.addCookies(c); } catch (e) {}
+}
 
 const app = express();
 app.disable("x-powered-by");
@@ -1399,7 +1413,7 @@ app.get("/clear-session", (req, res) => {
   if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) return res.status(401).json({ error: "Ugyldig token" });
   const host = hostKey(req.query.url || "") || String(req.query.host || "").toLowerCase().trim();
   if (!host) return res.status(400).json({ error: "Mangler url/host" });
-  const cleared = SESSION_CACHE.delete(host);
+  const cleared = SESSION_CACHE.delete(host); CONSENT_CACHE.delete(host);
   res.json({ ok: true, host, cleared });
 });
 
@@ -1731,9 +1745,13 @@ function setupLive(httpServer) {
     // Persist this host's cookies+consent so a fresh context (device/setting switch) reuses it
     // instead of re-prompting the cookie box. Reset via /clear-session ("Ryd session").
     const saveSession = async () => {
-      // Only login sites need a persisted session. Caching consent for normal sites caused a
-      // stale/partial consent cookie to be replayed → CMP suppressed + ads blocked. Skip them.
-      try { if (context && liveUrl) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState()); } catch {}
+      try {
+        if (!context || !liveUrl) return;
+        // Full session (staying signed in) only on LOGIN sites. Everyone gets their consent remembered
+        // — but ONLY the consent cookie, never the ad-state (which is what blocked ad fill before).
+        if (getLogin(liveUrl)) SESSION_CACHE.set(hostKey(liveUrl), await context.storageState());
+        await rememberConsent(context, liveUrl);
+      } catch {}
     };
     const cleanup = async () => {
       if (closed) return; closed = true;
@@ -1780,7 +1798,7 @@ function setupLive(httpServer) {
           send({ t: "status", msg: "Åbner side…" });
           // Reuse a cached logged-in session for this host (if we have one) so refresh / device
           // switch keeps you signed in without re-entering anything.
-          const cachedState = SESSION_CACHE.get(hostKey(url));   // reuse this host's session (cookies+consent) across URLs/settings
+          const cachedState = getLogin(url) ? SESSION_CACHE.get(hostKey(url)) : undefined; // full state: login sites only
           context = await (await getBrowser()).newContext({
             viewport: { width: vw, height: vh },
             deviceScaleFactor: liveDsf,
@@ -1788,6 +1806,9 @@ function setupLive(httpServer) {
             locale: LOCALE, timezoneId: TIMEZONE, ignoreHTTPSErrors: true,
             ...(cachedState ? { storageState: cachedState } : {}),
           });
+          // Non-login sites: seed ONLY the remembered consent cookie(s) — "accept once, never again"
+          // across visits, WITHOUT replaying stale ad-state (which is what blocked ad fill before).
+          if (!getLogin(url)) await seedConsent(context, url);
           if (BLOCK_MEDIA) {
             await context.route("**/*", (r) =>
               r.request().resourceType() === "media" ? r.abort() : r.continue()).catch(() => {});
