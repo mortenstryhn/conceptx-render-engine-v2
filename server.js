@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.71-consent-ads-fix";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.73-topscroll-debug2";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1436,6 +1436,7 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
   const device = String(req.query.device || DEFAULT_DEVICE);
   const manualConsent = req.query.consent === "manual";
   const wantShot = req.query.shot === "1" || req.query.shot === "true"; // return a screenshot instead of JSON
+  const placement = String(req.query.placement || "").trim();          // optional CSS selector to inject INTO (test slot recipes)
   let safeUrl;
   try { safeUrl = await assertSafeUrl(rawUrl); } catch (e) { return res.status(400).json({ error: e.message }); }
 
@@ -1461,19 +1462,47 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
     let spec = { width: 300, height: 240, type: "" };
     try { spec = parseAdnamiSpec(await fetchAdnamiInsTags(creative)); } catch (e) { out.injectError = String(e.message || e); }
     out.spec = spec;
-    if (!manualConsent) { if (spec.isSkin) await giveConsent(page).catch(() => {}); else await dismissConsent(page).catch(() => {}); }
+    if (!manualConsent) await giveConsent(page).catch(() => {});
     try {
-      const r = await injectAdnami(page, creative, "", spec);
+      const r = await injectAdnami(page, creative, placement, spec);
+      out.placement = placement || "(none)";
       out.hasSlot = r.hasSlot; out.method = r.method; out.mounted = r.mounted;
       if (r.fetchNote) out.fetchNote = r.fetchNote;
     } catch (e) { out.injectError = (out.injectError || "") + " inject:" + String(e.message || e); }
     out.slotCount = await page.evaluate(() => document.querySelectorAll('iframe[id^="adsm-iframe"]').length).catch(() => 0);
     await page.waitForTimeout(4000); // let the format settle before reading the DOM
-    out.dom = await page.evaluate(() => {
+    out.dom = await page.evaluate((cc) => {
       let adsm = null;
       try { adsm = (window.top && window.top.adsm) || window.adsm || null; } catch (e) { adsm = window.adsm || null; }
       const fidEl = document.querySelector("[data-adnm-fid]");
+      const rct = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.left), y: Math.round(r.top) }; };
+      const lc = (cc || "").toLowerCase();
+      const ours = Array.from(document.querySelectorAll("[data-adnm-cc]")).filter((e) => (e.getAttribute("data-adnm-cc") || "").toLowerCase() === lc);
+      // Shallow, safe dump of Adnami's OWN registration (window.adsm) — this is how the tool can
+      // find WHERE a topscroll belongs generically (per Adnami's config), not by guessing div names.
+      const shallow = (obj, depth) => {
+        const seen = new Set();
+        const walk = (v, d) => {
+          if (v === null || typeof v !== "object") { if (typeof v === "function") return "[fn]"; if (typeof v === "string") return v.slice(0, 120); return v; }
+          if (seen.has(v)) return "[circular]"; seen.add(v);
+          if (d <= 0) return Array.isArray(v) ? ("[array " + v.length + "]") : "[object]";
+          if (Array.isArray(v)) return v.slice(0, 10).map((x) => walk(x, d - 1));
+          const o = {}; let n = 0;
+          for (const k of Object.keys(v)) { if (n++ > 30) { o["…"] = "(more)"; break; } try { o[k] = walk(v[k], d - 1); } catch (e) { o[k] = "[err]"; } }
+          return o;
+        };
+        try { return walk(obj, depth); } catch (e) { return "[unserializable]"; }
+      };
+      let adsmInfo = null;
+      try {
+        if (adsm) { adsmInfo = { keys: Object.keys(adsm).slice(0, 50) };
+          ["placements", "formats", "slots", "tags", "units", "adunits", "config", "settings", "spec"].forEach((k) => { if (adsm[k] !== undefined) adsmInfo[k] = shallow(adsm[k], 3); }); }
+      } catch (e) { adsmInfo = "[err]"; }
       return {
+        adsm: adsmInfo,
+        ourCreative: ours.slice(0, 5).map((e) => ({ tag: e.tagName, cls: (typeof e.className === "string" ? e.className : "").slice(0, 60), rect: rct(e), hasIframe: !!e.querySelector("iframe") })),
+        topscrollEls: Array.from(document.querySelectorAll('[class*="topscroll" i],[class*="expand-frame" i],[id*="topscroll" i]')).slice(0, 8).map((e) => ({ tag: e.tagName, cls: (typeof e.className === "string" ? e.className : "").slice(0, 70), rect: rct(e) })),
+        injected: Array.from(document.querySelectorAll("[data-cx-injected]")).slice(0, 5).map((e) => ({ tag: e.tagName, rect: rct(e), hasIframe: !!e.querySelector("iframe") })),
         stickyWrapper: !!document.querySelector(".adsm-sticky-wrapper"),
         contentBackground: !!document.querySelector(".adsm-contentBackground"),
         wallpaper: !!document.querySelector(".adsm-wallpaper, [class*='adsm-wallpaper']"),
@@ -1488,7 +1517,7 @@ app.get(["/adnami-render-debug", "/adnm-inspect", "/adnm-inspect2"], async (req,
           return { tag: c.tagName, id: (c.id || "").slice(0, 30), cls: (typeof c.className === "string" ? c.className : "").slice(0, 45), pos: cs.position, z: cs.zIndex, bg: cs.backgroundColor, w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.left) };
         }),
       };
-    });
+    }, creative);
     // Optional: return a SCREENSHOT of exactly this diagnostic state, so we can SEE
     // whether the "mounted" skin (DOM flags above) is actually visible with its wings.
     if (wantShot) {
