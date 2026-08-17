@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.68-smoothness";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.70-warm-login";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -241,9 +241,13 @@ if (PROXY) console.log(`Proxy aktiv → ${PROXY.server}${PROXY.username ? " (log
  * SITE_LOGINS = JSON array, e.g.:                                    *
  * [{"domain":"mingolf.golf.se","user":"NAME","pass":"SECRET",        *
  *   "userSel":"#username","passSel":"#password",                     *
- *   "submitSel":"button[type=submit]"}]                             *
+ *   "submitSel":"button[type=submit]",                              *
+ *   "warmUrl":"https://mingolf.golf.se/start/"}]                    *
  * userSel/passSel/submitSel are OPTIONAL — a generic form heuristic  *
- * is used when they're absent.                                       *
+ * is used when they're absent. warmUrl is OPTIONAL: a page that      *
+ * REQUIRES sign-in; the engine pre-logs-in there at boot so your     *
+ * first real visit is instant (the slow sign-in happens in the       *
+ * background, not while you wait).                                    *
  * ------------------------------------------------------------------ */
 let SITE_LOGINS = [];
 try { if (process.env.SITE_LOGINS) SITE_LOGINS = JSON.parse(process.env.SITE_LOGINS) || []; }
@@ -802,8 +806,15 @@ async function needsLogin(page) {
 // (first text/email input = username, input[type=password] = password, a submit button / Enter).
 async function autoLogin(page, cfg, send) {
   const passSel = cfg.passSel || 'input[type="password"]';
-  let passHandle;
-  try { passHandle = await page.waitForSelector(passSel, { timeout: 8000, state: "visible" }); } catch (e) { return false; }
+  // The login page can be slow through the residential proxy, and a consent wall can cover the
+  // form. Retry a few times: accept consent, then wait (generously) for the password field.
+  let passHandle = null;
+  for (let attempt = 1; attempt <= 3 && !passHandle; attempt++) {
+    await giveConsent(page).catch(() => {});
+    if (send && attempt > 1) send({ t: "status", msg: `Venter på login-formular… (forsøg ${attempt}/3)` });
+    try { passHandle = await page.waitForSelector(passSel, { timeout: 12000, state: "visible" }); } catch (e) { passHandle = null; }
+  }
+  if (!passHandle) { if (send) send({ t: "notice", msg: "Auto-login: adgangskodefeltet dukkede aldrig op (siden loadede måske for langsomt gennem proxyen). Tryk Genindlæs." }); return false; }
   try {
     if (send) send({ t: "status", msg: "Logger ind…" });
     // Username field: explicit selector if given, else the visible non-password input nearest
@@ -846,10 +857,15 @@ async function ensureLoggedIn(page, url, context, send) {
   // accepting it can RELOAD the page (which would otherwise wipe a premature login).
   await giveConsent(page).catch(() => {});
   await page.waitForTimeout(600);
-  if (!(await needsLogin(page))) {                 // already logged in (cached session worked)
+  // A deep page (e.g. /start/) often redirects to /login when logged out — give a late / JS
+  // redirect a moment to land before we conclude that we're already signed in.
+  let need = await needsLogin(page);
+  if (!need) { await page.waitForTimeout(1500); need = await needsLogin(page); }
+  if (!need) {                                     // already logged in (cached session worked)
     try { SESSION_CACHE.set(hostKey(url), await context.storageState()); } catch (e) {} // refresh cache (now incl. consent cookie)
     return false;
   }
+  if (send) send({ t: "status", msg: "Login-side fundet — logger automatisk ind…" });
   const ok = await autoLogin(page, cfg, send);
   if (ok) {
     // autoLogin's submit already redirected us to the signed-in page. DON'T navigate back to
@@ -1807,6 +1823,27 @@ function setupLive(httpServer) {
 
 const server = app.listen(PORT, () => console.log(`Render engine lytter på :${PORT}`));
 setupLive(server);
+
+// Pre-login configured sites at boot, so the FIRST user visit is instant: the (slow, through-
+// the-proxy) sign-in happens here in the background and is cached, instead of costing you time
+// when you enter the URL. Re-runs after every deploy/restart. Fire-and-forget; never blocks.
+async function warmLogins() {
+  for (const cfg of SITE_LOGINS) {
+    if (!cfg || !cfg.domain) continue;
+    const warmUrl = cfg.warmUrl || cfg.loginUrl || ("https://" + cfg.domain + "/");
+    if (SESSION_CACHE.has(hostKey(warmUrl))) continue;   // already warm
+    let ctx = null;
+    try {
+      ctx = await (await getBrowser()).newContext({ locale: LOCALE, timezoneId: TIMEZONE, ignoreHTTPSErrors: true });
+      const pg = await ctx.newPage();
+      await robustGoto(pg, warmUrl);
+      const ok = await ensureLoggedIn(pg, warmUrl, ctx);   // caches the signed-in session on success
+      console.log(`Warm-login ${cfg.domain}: ${ok ? "logget ind ✓ (cachet)" : "intet login udført (sæt evt. warmUrl til en beskyttet side)"}`);
+    } catch (e) { console.log("Warm-login fejlede for", cfg.domain, "-", (e && e.message) || e); }
+    finally { try { if (ctx) await ctx.close(); } catch {} }
+  }
+}
+setTimeout(() => { warmLogins().catch(() => {}); }, 1500);
 
 // Graceful shutdown
 for (const sig of ["SIGINT", "SIGTERM"]) {
