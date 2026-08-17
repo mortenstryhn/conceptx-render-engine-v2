@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.78-remember-consent";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.79-ads-on-navigation";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1689,6 +1689,7 @@ function setupLive(httpServer) {
     liveCount++;
     METRICS.live.active++; METRICS.live.total++;
     let context = null, page = null, cdp = null, closed = false, started = false;
+    let liveReady = false, navSeq = 0; // liveReady: initial load done → re-run consent+ads on later link-clicks
     let idleTimer = null;
     let manualConsent = false;
     let motionTimer = null;            // adaptive stream: revert-to-sharp timer
@@ -1803,7 +1804,23 @@ function setupLive(httpServer) {
               if (nu && nu !== "about:blank") { await page.goto(nu, { waitUntil: "domcontentloaded" }); if (!manualConsent) await giveConsent(page); }
             } catch { try { await pg.close(); } catch {} }
           });
-          page.on("framenavigated", (fr) => { if (fr === page.mainFrame()) { send({ t: "url", url: page.url() }); saveSession(); } });
+          page.on("framenavigated", async (fr) => {
+            if (fr !== page.mainFrame()) return;
+            send({ t: "url", url: page.url() });
+            saveSession();
+            // When you CLICK to a new article, give that page the same treatment the first page got
+            // (accept consent + re-place your creative) so its ads fill — this is exactly what the
+            // Refresh button does, now automatic. Isolated to navigation; touches nothing else.
+            if (!liveReady || closed) return;
+            const mySeq = ++navSeq;
+            try {
+              await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+              if (mySeq !== navSeq || closed) return;            // a newer navigation superseded this one
+              if (!manualConsent) await giveConsent(page).catch(() => {});
+              if (mySeq !== navSeq || closed) return;
+              await doInject();                                   // no-op when no creative is set
+            } catch (e) {}
+          });
 
           cdp = await context.newCDPSession(page);
           cdp.on("Page.screencastFrame", async (f) => {
@@ -1855,6 +1872,7 @@ function setupLive(httpServer) {
           await ensureLoggedIn(page, url, context, send).catch(() => {});
           if (!manualConsent) await giveConsent(page);
           await doInject();
+          liveReady = true;   // initial page done → clicking to a new article now re-runs consent+ads
         }
         else if (!page) { return; }
         else {
