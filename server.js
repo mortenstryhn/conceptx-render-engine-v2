@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.85-smooth";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.86-interscroll-fix";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1729,10 +1729,11 @@ let liveCount = 0;
 const PREVIEW_HOST = "preview.adnami.io";
 function isPreviewUrl(u) { try { return new URL(u).host === PREVIEW_HOST; } catch { return false; } }
 // Runs INSIDE the Adnami preview page (via addInitScript, before any of Adnami's own JS).
-// It keeps only the creative container (#adnm-iphone) + the neutral wireframe article, and
-// continuously removes Adnami's presentation chrome (theme switcher, QR, help, consent) and
-// any decorative full-page background image — because Adnami re-renders that chrome AFTER load
-// (e.g. the phone-on-photo presentation of a mobile creative), a one-shot hide misses it.
+// Removes ONLY Adnami's presentation chrome (theme switcher, QR, help, consent, and the decorative
+// photo background .mobile-background) via EXPLICIT, targeted selectors. It deliberately does NOT
+// touch arbitrary large/fixed/background layers — some creative formats (interscroll, midscroll,
+// doublescreen) render the creative itself as a big fixed full-page layer, and a generic "hide big
+// empty layers" sweep wiped those creatives. Explicit selectors keep every creative intact.
 function previewStripInit() {
   var CSS =
     ".page-header-theme-switcher,.page-header-meta,.page-header,[class*='page-header']," +
@@ -1740,46 +1741,22 @@ function previewStripInit() {
     ".qrcode-container,[class*='qrcode'],#mobile-view-toggle,[id*='mobile-view-toggle']," +
     ".mobile-background,[class*='mobile-background']," +
     "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
-    ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}" +
-    "html,body{background:#fff !important;}";
+    ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}";
   function inject() {
     if (document.getElementById("cx-strip")) return;
     var s = document.createElement("style");
     s.id = "cx-strip"; s.textContent = CSS;
     (document.head || document.documentElement).appendChild(s);
   }
-  function sweep() {
-    inject();
-    try {
-      var body = document.body; if (!body) return;
-      for (var i = 0; i < body.children.length; i++) {
-        var d = body.children[i];
-        if (d.id === "adnm-iphone" || d.tagName !== "DIV") continue;
-        var cs = getComputedStyle(d);
-        // Kill any decorative full-page background photo (the "mobile creative on desktop" scene).
-        if (cs.backgroundImage && cs.backgroundImage !== "none") {
-          d.style.setProperty("background", "#fff", "important");
-          d.style.setProperty("background-image", "none", "important");
-        }
-        // The photo scene is often a big fixed/absolute empty layer behind the phone — hide it.
-        if ((cs.position === "fixed" || cs.position === "absolute") &&
-            d.id !== "adnm-iphone" && d.offsetHeight > 300 && d.textContent.trim() === "") {
-          d.style.setProperty("display", "none", "important");
-        }
-      }
-    } catch (e) {}
-  }
   inject();
-  if (document.readyState !== "loading") sweep();
-  document.addEventListener("DOMContentLoaded", sweep);
+  document.addEventListener("DOMContentLoaded", inject);
+  // Re-inject only if Adnami swaps out <head> — never manipulate creative elements.
   try {
-    new MutationObserver(sweep).observe(document.documentElement || document,
-      { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style"] });
+    new MutationObserver(inject).observe(document.documentElement || document, { childList: true, subtree: true });
   } catch (e) {}
-  var n = 0, iv = setInterval(function () { sweep(); if (++n > 50) clearInterval(iv); }, 400); // ~20s safety net
+  var n = 0, iv = setInterval(function () { inject(); if (++n > 50) clearInterval(iv); }, 400); // ~20s safety net
 }
 async function applyPreviewStrip(page) {
-  // Belt-and-braces: also run one sweep in the current document after load.
   try { await page.evaluate(previewStripInit); } catch {}
 }
 
