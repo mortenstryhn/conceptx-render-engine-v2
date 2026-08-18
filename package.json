@@ -5,7 +5,8 @@
   "type": "module",
   "engines": { "node": ">=18" },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "playwright install --with-deps chrome chromium || playwright install chrome chromium || playwright install chromium || true"
   },
   "dependencies": {
     "express": "^4.21.2",
