@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.84-chrome-default";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.85-smooth";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -327,13 +327,21 @@ async function getBrowser() {
     // postinstall on deploy; if it still can't launch, we fall back to bundled Chromium (no outage).
     // Set CHROME_CHANNEL="" to force bundled Chromium, or "msedge" for Edge.
     const CHROME_CHANNEL = process.env.CHROME_CHANNEL === "" ? "" : (process.env.CHROME_CHANNEL || "chrome");
+    // Scroll smoothness is CPU-bound on this 2-core host. GPU_MODE lets you try SwiftShader GL
+    // compositing (often smoother scroll + video than the legacy software-raster path) WITHOUT a
+    // code change: set env GPU_MODE=swiftshader to try it, GPU_MODE=off to revert. Default stays
+    // "off" (= --disable-gpu, the current proven behavior) so nothing regresses unless you opt in.
+    const GPU_MODE = (process.env.GPU_MODE || "off").toLowerCase();
+    const gpuArgs = GPU_MODE === "swiftshader"
+      ? ["--enable-unsafe-swiftshader", "--ignore-gpu-blocklist", "--enable-gpu-rasterization"]
+      : ["--disable-gpu"];
     const launchOpts = {
       ...(launchProxy ? { proxy: launchProxy } : {}), // route every context/page through the (relayed) proxy
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
+        ...gpuArgs,
         // Let video creatives play without a user gesture (and keep them silent).
         "--autoplay-policy=no-user-gesture-required",
         "--mute-audio",
@@ -1875,7 +1883,9 @@ function setupLive(httpServer) {
           manualConsent = msg.consent === "manual";
           // Per-session quality/sharpness (client can trade smoothness ↔ sharpness).
           let liveDsf   = Math.max(1, Math.min(2, Number(msg.dsf) || LIVE_DSF));
-          const liveQ   = Math.max(LIVE_QUALITY_MIN, Math.min(90, Number(msg.quality) || LIVE_QUALITY));
+          // Preview may request a lower quality (fewer CPU cycles per JPEG → more fps → smoother scroll).
+          const qFloor  = previewMode ? 40 : LIVE_QUALITY_MIN;
+          const liveQ   = Math.max(qFloor, Math.min(90, Number(msg.quality) || LIVE_QUALITY));
           // Big desktop viewports (e.g. 2560×1440) are heavy to encode+stream. Drop the
           // extra supersampling there so playback stays smooth (layout is unaffected).
           if (vw * vh > 1600 * 1000) liveDsf = 1;
