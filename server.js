@@ -53,7 +53,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.82-preview-strip";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "2.84-chrome-default";                                    // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -321,14 +321,22 @@ async function getBrowser() {
         }
       }
     }
-    browserPromise = chromium.launch({
-      executablePath: process.env.CHROMIUM_PATH || undefined, // optional override (local dev); unset in production
+    // DEFAULT to REAL Google Chrome (has H.264/AAC codecs) so Adnami VIDEO creatives render.
+    // Bundled Chromium cannot decode MP4/H.264 → video ads go blank, which is unacceptable since
+    // most Adnami creatives carry video. Chrome is installed automatically by package.json's
+    // postinstall on deploy; if it still can't launch, we fall back to bundled Chromium (no outage).
+    // Set CHROME_CHANNEL="" to force bundled Chromium, or "msedge" for Edge.
+    const CHROME_CHANNEL = process.env.CHROME_CHANNEL === "" ? "" : (process.env.CHROME_CHANNEL || "chrome");
+    const launchOpts = {
       ...(launchProxy ? { proxy: launchProxy } : {}), // route every context/page through the (relayed) proxy
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
         "--disable-gpu",
+        // Let video creatives play without a user gesture (and keep them silent).
+        "--autoplay-policy=no-user-gesture-required",
+        "--mute-audio",
         // Keep the headless (effectively "hidden") page rendering at full speed. Otherwise Chromium
         // throttles its timers / requestAnimationFrame / compositor for the backgrounded page — which
         // is exactly what shows up as scroll-jank in the live desktop stream. Safe; no feature impact.
@@ -340,7 +348,22 @@ async function getBrowser() {
         "--disable-features=IsolateOrigins,site-per-process,CalculateNativeWinOcclusion",
         "--disable-site-isolation-trials",
       ],
-    });
+    };
+    browserPromise = (async () => {
+      // Prefer real Chrome (H.264/AAC codecs → video creatives play) when CHROME_CHANNEL is set.
+      // If it can't launch (Chrome not installed on this host), fall back to bundled Chromium so
+      // the service never goes down — only video creatives stay blank in that case.
+      if (CHROME_CHANNEL) {
+        try {
+          const b = await chromium.launch({ ...launchOpts, channel: CHROME_CHANNEL });
+          console.log("Browser: rigtig Chrome (channel=" + CHROME_CHANNEL + ") — MP4/H.264 video understøttet");
+          return b;
+        } catch (e) {
+          console.log("Chrome-channel kunne ikke starte (" + (e && e.message || e) + ") → falder tilbage til bundtet Chromium");
+        }
+      }
+      return chromium.launch({ ...launchOpts, executablePath: process.env.CHROMIUM_PATH || undefined });
+    })();
   }
   return browserPromise;
 }
@@ -1381,6 +1404,8 @@ app.get("/health", (_req, res) => {
     ok: true,
     version: ENGINE_VERSION,
     proxy: proxyInfo(),
+    browserChannel: (process.env.CHROME_CHANNEL === "" ? "chromium (forced — no MP4/H.264)"
+                     : (process.env.CHROME_CHANNEL || "chrome (default — MP4/H.264 video)")),
     devices: Object.keys(DEVICES),
     // --- instrumentation ("measure first") ---
     uptimeSec: Math.round((Date.now() - METRICS.startedAt) / 1000),
@@ -1703,7 +1728,9 @@ function isPreviewUrl(u) { try { return new URL(u).host === PREVIEW_HOST; } catc
 function previewStripInit() {
   var CSS =
     ".page-header-theme-switcher,.page-header-meta,.page-header,[class*='page-header']," +
-    ".qrcode-container,#mobile-view-toggle,.theme-switcher,.qrcode,[class*='qrcode']," +
+    "#theme-switcher,.theme-switcher-control,[id*='theme-switcher'],[class*='theme-switcher']," +
+    ".qrcode-container,[class*='qrcode'],#mobile-view-toggle,[id*='mobile-view-toggle']," +
+    ".mobile-background,[class*='mobile-background']," +
     "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
     ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}" +
     "html,body{background:#fff !important;}";
