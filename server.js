@@ -6,6 +6,10 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 3.1-preview  Tilføjet "Preview only"-tilstand (isoleret, kun ved preview:1):
+//              motoren renderer Adnamis egen preview-side og stripper dens
+//              chrome væk, så kun kreativet vises på en neutral side. Live-stien
+//              er urørt (previewMode=false → nøjagtig 3.0-adfærd).
 // 3.0-video    Bygget oven på den rene 2.80-baseline. Tilføjet VIDEO i annoncer:
 //              motoren kører rigtig Google Chrome (H.264/AAC-codecs) med autoplay,
 //              og LIVE-sessioner blokerer ikke længere media, så videoannoncer
@@ -66,7 +70,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "3.0-video";                                            // bump when deploying; visible at /health
+const ENGINE_VERSION  = "3.1-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1720,6 +1724,40 @@ app.get("/", (_req, res) =>
  * ------------------------------------------------------------------ */
 let liveCount = 0;
 
+/* ------------------------------------------------------------------ *
+ * "Preview only" (Tilstand) — 3.1                                      *
+ * Adnami's RMB engine only renders a creative on an authorised host,   *
+ * so we render Adnami's OWN preview page (preview.adnami.io) top-level  *
+ * and strip its surrounding chrome so ONLY the creative sits on a       *
+ * neutral wireframe page. Fully ISOLATED: only runs when the client     *
+ * sends preview:1. Live is never touched.                              *
+ * ------------------------------------------------------------------ */
+const PREVIEW_HOST = "preview.adnami.io";
+// Runs INSIDE the Adnami preview page (via addInitScript, before Adnami's own JS). Hides ONLY
+// Adnami's presentation chrome via EXPLICIT selectors — it deliberately does NOT touch large/fixed/
+// background layers, because some formats (interscroll/midscroll/doublescreen) ARE big fixed layers
+// and a generic "hide big empty layers" sweep would wipe the creative itself.
+function previewStripInit() {
+  var CSS =
+    ".page-header-theme-switcher,.page-header-meta,.page-header,[class*='page-header']," +
+    "#theme-switcher,.theme-switcher-control,[id*='theme-switcher'],[class*='theme-switcher']," +
+    ".qrcode-container,[class*='qrcode'],#mobile-view-toggle,[id*='mobile-view-toggle']," +
+    ".mobile-background,[class*='mobile-background']," +
+    "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
+    ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}";
+  function inject() {
+    if (document.getElementById("cx-strip")) return;
+    var s = document.createElement("style");
+    s.id = "cx-strip"; s.textContent = CSS;
+    (document.head || document.documentElement).appendChild(s);
+  }
+  inject();
+  document.addEventListener("DOMContentLoaded", inject);
+  try { new MutationObserver(inject).observe(document.documentElement || document, { childList: true, subtree: true }); } catch (e) {}
+  var n = 0, iv = setInterval(function () { inject(); if (++n > 50) clearInterval(iv); }, 400); // ~20s safety net
+}
+async function applyPreviewStrip(page) { try { await page.evaluate(previewStripInit); } catch {} }
+
 function setupLive(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: "/live" });
 
@@ -1812,6 +1850,7 @@ function setupLive(httpServer) {
       try {
         if (msg.t === "start") {
           if (started) return; started = true;
+          const previewMode = !!msg.preview; // "Preview only" (Tilstand): Adnami page + strip chrome
           const dev = DEVICES[msg.device] || DEVICES[DEFAULT_DEVICE];
           let vw = dev.w, vh = dev.h;
           if (dev.mobile && msg.landscape) { vw = dev.h; vh = dev.w; }
@@ -1848,6 +1887,8 @@ function setupLive(httpServer) {
             await context.route("**/*", (r) =>
               r.request().resourceType() === "media" ? r.abort() : r.continue()).catch(() => {});
           }
+          // Preview only: strip Adnami's chrome from the first paint and keep it stripped.
+          if (previewMode) { try { await context.addInitScript(previewStripInit); } catch {} }
           page = await context.newPage();
 
           // Fold "open in new tab" popups back into the main tab.
@@ -1874,7 +1915,8 @@ function setupLive(httpServer) {
               if (mySeq !== navSeq || closed) return;            // a newer navigation superseded this one
               if (!manualConsent) await giveConsent(page).catch(() => {});
               if (mySeq !== navSeq || closed) return;
-              await doInject();                                   // no-op when no creative is set
+              if (previewMode) await applyPreviewStrip(page);     // preview: re-hide Adnami chrome
+              else await doInject();                              // no-op when no creative is set
             } catch (e) {}
           });
 
@@ -1916,18 +1958,20 @@ function setupLive(httpServer) {
           if (stateTimer.unref) stateTimer.unref();
 
           // Remember the creative for this session (validated) so we can re-inject after navigations.
-          if (msg.creative) {
+          // Skipped in preview mode — the Adnami page renders the creative itself; we don't inject.
+          if (msg.creative && !previewMode) {
             try { liveCreative = normalizeCreative(msg.creative); livePlacement = String(msg.placement || "").trim(); }
             catch (e) { liveCreative = ""; send({ t: "notice", msg: e.message }); }
           }
 
           // Robust navigation (retries + verifies it didn't land on chrome-error).
           const navOk = await robustGoto(page, url, send);
-          if (!navOk) send({ t: "notice", msg: "Kunne ikke hente siden gennem proxy'en efter flere forsøg. Tryk genindlæs, eller prøv igen om lidt." });
+          if (!navOk) send({ t: "notice", msg: "Kunne ikke hente siden efter flere forsøg. Tryk genindlæs, eller prøv igen om lidt." });
           // Auto sign-in for configured login sites (no-op for everything else).
           await ensureLoggedIn(page, url, context, send).catch(() => {});
           if (!manualConsent) await giveConsent(page);
-          await doInject();
+          if (previewMode) await applyPreviewStrip(page);   // preview: show only the creative on a neutral page
+          else await doInject();
           liveReady = true;   // initial page done → clicking to a new article now re-runs consent+ads
         }
         else if (!page) { return; }
