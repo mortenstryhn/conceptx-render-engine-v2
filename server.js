@@ -3,13 +3,15 @@
 // dismisses common consent banners, and returns a screenshot (PNG/JPEG).
 //
 // ── CHANGELOG (nyeste øverst) ─────────────────────────────────────────────
-// 2.87-stabil   Konsolideret, stabil baseline. Live-logikken uændret fra det
-//               oprindelige tool. Browseren er rigtig Chrome (så VIDEO virker i
-//               BÅDE Live og Kun preview). Fjernet eksperimentelle tweaks
-//               (GPU_MODE, preview-kvalitet, scroll-timing) der ikke hjalp.
-//               Kun preview er isoleret (preview:1) og rører ikke Live.
-//               KENDT ÅBEN: interscroll/doublescreen-formater vises ikke i
-//               Kun preview endnu (undersøges isoleret, uden at røre Live).
+// NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
+// gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
+//
+// 3.0-video    Bygget oven på den rene 2.80-baseline. Tilføjet VIDEO i annoncer:
+//              motoren kører rigtig Google Chrome (H.264/AAC-codecs) med autoplay,
+//              og LIVE-sessioner blokerer ikke længere media, så videoannoncer
+//              afspilles. Sikker fallback til bundtet Chromium hvis Chrome ikke
+//              kan starte. Ingen ændring i Live-flow, proxy eller consent-logik.
+// (2.80)       Ren baseline-backup (consent-once). Selve fundamentet, urørt.
 // ──────────────────────────────────────────────────────────────────────────
 //
 // GET /render?url=<page>&device=<id>&landscape=0&fullPage=1&format=jpeg&fresh=0&token=<secret>
@@ -54,7 +56,8 @@ const ALLOW_ORIGIN    = process.env.ALLOW_ORIGIN || "*";
 const MAX_SHOT_HEIGHT = parseInt(process.env.MAX_SHOT_HEIGHT || "4500", 10); // CSS px (lower = safer on 512MB)
 const MAX_DSF         = parseFloat(process.env.MAX_DSF || "2");              // cap pixel ratio for screenshots
 const RENDER_TIMEOUT_MS = parseInt(process.env.RENDER_TIMEOUT_MS || "75000", 10);
-const BLOCK_MEDIA     = (process.env.BLOCK_MEDIA || "true") === "true";      // drop video/audio streams (heavy, not needed for a screenshot)
+const BLOCK_MEDIA     = (process.env.BLOCK_MEDIA || "true") === "true";      // drop video/audio streams for /render SCREENSHOTS (heavy, not needed for a still image)
+const BLOCK_MEDIA_LIVE= (process.env.BLOCK_MEDIA_LIVE || "false") === "true";// LIVE sessions keep media by default so VIDEO ad creatives play; set true to block
 const MAX_LIVE        = parseInt(process.env.MAX_LIVE_SESSIONS || "2", 10);  // concurrent live/interactive sessions (each holds a browser tab open)
 const LIVE_IDLE_MS    = parseInt(process.env.LIVE_IDLE_MS || "180000", 10);  // auto-close a live session after this much inactivity
 const LIVE_DSF        = parseFloat(process.env.LIVE_DSF || "1");             // pixel ratio for LIVE streaming (1 = smoothest; 2 = sharper but heavier)
@@ -63,7 +66,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "2.87-stabil";                                    // bump when deploying; visible at /health
+const ENGINE_VERSION  = "3.0-video";                                            // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -331,11 +334,10 @@ async function getBrowser() {
         }
       }
     }
-    // DEFAULT to REAL Google Chrome (has H.264/AAC codecs) so Adnami VIDEO creatives render.
-    // Bundled Chromium cannot decode MP4/H.264 → video ads go blank, which is unacceptable since
-    // most Adnami creatives carry video. Chrome is installed automatically by package.json's
-    // postinstall on deploy; if it still can't launch, we fall back to bundled Chromium (no outage).
-    // Set CHROME_CHANNEL="" to force bundled Chromium, or "msedge" for Edge.
+    // VIDEO IN ADS: use REAL Google Chrome (has H.264/AAC codecs). Bundled Chromium cannot decode
+    // MP4/H.264, so video ad creatives render blank there. Chrome is installed by package.json's
+    // postinstall on deploy; if it can't launch on this host we fall back to bundled Chromium so the
+    // service never goes down (only video stays blank in that case). Force Chromium with CHROME_CHANNEL="".
     const CHROME_CHANNEL = process.env.CHROME_CHANNEL === "" ? "" : (process.env.CHROME_CHANNEL || "chrome");
     const launchOpts = {
       ...(launchProxy ? { proxy: launchProxy } : {}), // route every context/page through the (relayed) proxy
@@ -344,7 +346,7 @@ async function getBrowser() {
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
         "--disable-gpu",
-        // Let video creatives play without a user gesture (and keep them silent).
+        // Let ad video autoplay without a user gesture, muted (we never stream audio anyway).
         "--autoplay-policy=no-user-gesture-required",
         "--mute-audio",
         // Keep the headless (effectively "hidden") page rendering at full speed. Otherwise Chromium
@@ -360,16 +362,13 @@ async function getBrowser() {
       ],
     };
     browserPromise = (async () => {
-      // Prefer real Chrome (H.264/AAC codecs → video creatives play) when CHROME_CHANNEL is set.
-      // If it can't launch (Chrome not installed on this host), fall back to bundled Chromium so
-      // the service never goes down — only video creatives stay blank in that case.
       if (CHROME_CHANNEL) {
         try {
           const b = await chromium.launch({ ...launchOpts, channel: CHROME_CHANNEL });
-          console.log("Browser: rigtig Chrome (channel=" + CHROME_CHANNEL + ") — MP4/H.264 video understøttet");
+          console.log("Browser: rigtig Chrome (channel=" + CHROME_CHANNEL + ") — video (H.264/AAC) understøttet");
           return b;
         } catch (e) {
-          console.log("Chrome-channel kunne ikke starte (" + (e && e.message || e) + ") → falder tilbage til bundtet Chromium");
+          console.log("Chrome kunne ikke starte (" + (e && e.message || e) + ") → falder tilbage til bundtet Chromium (video bliver blank)");
         }
       }
       return chromium.launch({ ...launchOpts, executablePath: process.env.CHROMIUM_PATH || undefined });
@@ -1413,9 +1412,9 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     version: ENGINE_VERSION,
+    browserChannel: (process.env.CHROME_CHANNEL === "" ? "chromium (tvunget — ingen video)"
+                     : (process.env.CHROME_CHANNEL || "chrome (video: H.264/AAC)")),
     proxy: proxyInfo(),
-    browserChannel: (process.env.CHROME_CHANNEL === "" ? "chromium (forced — no MP4/H.264)"
-                     : (process.env.CHROME_CHANNEL || "chrome (default — MP4/H.264 video)")),
     devices: Object.keys(DEVICES),
     // --- instrumentation ("measure first") ---
     uptimeSec: Math.round((Date.now() - METRICS.startedAt) / 1000),
@@ -1721,47 +1720,6 @@ app.get("/", (_req, res) =>
  * ------------------------------------------------------------------ */
 let liveCount = 0;
 
-/* ------------------------------------------------------------------ *
- * "Kun preview" mode: render Adnami's own preview page (where their   *
- * RMB engine IS authorised — it refuses to render on any other host)  *
- * and strip away Adnami's surrounding chrome so ONLY the creative sits *
- * on a neutral wireframe page. No proxy geo, no publisher consent —    *
- * it's Adnami's own fast domain. Isolated to preview sessions.         *
- * ------------------------------------------------------------------ */
-const PREVIEW_HOST = "preview.adnami.io";
-function isPreviewUrl(u) { try { return new URL(u).host === PREVIEW_HOST; } catch { return false; } }
-// Runs INSIDE the Adnami preview page (via addInitScript, before any of Adnami's own JS).
-// Removes ONLY Adnami's presentation chrome (theme switcher, QR, help, consent, and the decorative
-// photo background .mobile-background) via EXPLICIT, targeted selectors. It deliberately does NOT
-// touch arbitrary large/fixed/background layers — some creative formats (interscroll, midscroll,
-// doublescreen) render the creative itself as a big fixed full-page layer, and a generic "hide big
-// empty layers" sweep wiped those creatives. Explicit selectors keep every creative intact.
-function previewStripInit() {
-  var CSS =
-    ".page-header-theme-switcher,.page-header-meta,.page-header,[class*='page-header']," +
-    "#theme-switcher,.theme-switcher-control,[id*='theme-switcher'],[class*='theme-switcher']," +
-    ".qrcode-container,[class*='qrcode'],#mobile-view-toggle,[id*='mobile-view-toggle']," +
-    ".mobile-background,[class*='mobile-background']," +
-    "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
-    ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}";
-  function inject() {
-    if (document.getElementById("cx-strip")) return;
-    var s = document.createElement("style");
-    s.id = "cx-strip"; s.textContent = CSS;
-    (document.head || document.documentElement).appendChild(s);
-  }
-  inject();
-  document.addEventListener("DOMContentLoaded", inject);
-  // Re-inject only if Adnami swaps out <head> — never manipulate creative elements.
-  try {
-    new MutationObserver(inject).observe(document.documentElement || document, { childList: true, subtree: true });
-  } catch (e) {}
-  var n = 0, iv = setInterval(function () { inject(); if (++n > 50) clearInterval(iv); }, 400); // ~20s safety net
-}
-async function applyPreviewStrip(page) {
-  try { await page.evaluate(previewStripInit); } catch {}
-}
-
 function setupLive(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: "/live" });
 
@@ -1854,7 +1812,6 @@ function setupLive(httpServer) {
       try {
         if (msg.t === "start") {
           if (started) return; started = true;
-          const previewMode = !!msg.preview || isPreviewUrl(msg.url); // "Kun preview": Adnami page + strip chrome
           const dev = DEVICES[msg.device] || DEVICES[DEFAULT_DEVICE];
           let vw = dev.w, vh = dev.h;
           if (dev.mobile && msg.landscape) { vw = dev.h; vh = dev.w; }
@@ -1886,14 +1843,11 @@ function setupLive(httpServer) {
           // Non-login sites: seed ONLY the remembered consent cookie(s) — "accept once, never again"
           // across visits, WITHOUT replaying stale ad-state (which is what blocked ad fill before).
           if (!getLogin(url)) await seedConsent(context, url);
-          // Preview mode keeps media so video/rich-media creatives play; Live blocks it (heavy) as before.
-          if (BLOCK_MEDIA && !previewMode) {
+          // LIVE keeps media by default so VIDEO ad creatives play (opt out with BLOCK_MEDIA_LIVE=true).
+          if (BLOCK_MEDIA_LIVE) {
             await context.route("**/*", (r) =>
               r.request().resourceType() === "media" ? r.abort() : r.continue()).catch(() => {});
           }
-          // Preview mode: strip Adnami's presentation chrome from the very first paint and keep it
-          // stripped as Adnami re-renders (theme switcher, QR, help, photo backgrounds).
-          if (previewMode) { try { await context.addInitScript(previewStripInit); } catch {} }
           page = await context.newPage();
 
           // Fold "open in new tab" popups back into the main tab.
@@ -1920,8 +1874,7 @@ function setupLive(httpServer) {
               if (mySeq !== navSeq || closed) return;            // a newer navigation superseded this one
               if (!manualConsent) await giveConsent(page).catch(() => {});
               if (mySeq !== navSeq || closed) return;
-              if (previewMode) await applyPreviewStrip(page);     // preview: re-hide Adnami chrome
-              else await doInject();                              // no-op when no creative is set
+              await doInject();                                   // no-op when no creative is set
             } catch (e) {}
           });
 
@@ -1963,20 +1916,18 @@ function setupLive(httpServer) {
           if (stateTimer.unref) stateTimer.unref();
 
           // Remember the creative for this session (validated) so we can re-inject after navigations.
-          // Skipped in preview mode — the Adnami page renders the creative itself; we don't inject.
-          if (msg.creative && !previewMode) {
+          if (msg.creative) {
             try { liveCreative = normalizeCreative(msg.creative); livePlacement = String(msg.placement || "").trim(); }
             catch (e) { liveCreative = ""; send({ t: "notice", msg: e.message }); }
           }
 
           // Robust navigation (retries + verifies it didn't land on chrome-error).
           const navOk = await robustGoto(page, url, send);
-          if (!navOk) send({ t: "notice", msg: "Kunne ikke hente siden efter flere forsøg. Tryk genindlæs, eller prøv igen om lidt." });
+          if (!navOk) send({ t: "notice", msg: "Kunne ikke hente siden gennem proxy'en efter flere forsøg. Tryk genindlæs, eller prøv igen om lidt." });
           // Auto sign-in for configured login sites (no-op for everything else).
           await ensureLoggedIn(page, url, context, send).catch(() => {});
           if (!manualConsent) await giveConsent(page);
-          if (previewMode) await applyPreviewStrip(page);   // preview: show only the creative on a neutral page
-          else await doInject();
+          await doInject();
           liveReady = true;   // initial page done → clicking to a new article now re-runs consent+ads
         }
         else if (!page) { return; }
