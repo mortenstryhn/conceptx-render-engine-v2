@@ -6,6 +6,13 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 3.3-preview  Preview only: renderer nu i en viewport der matcher Adnamis egen
+//              preview-viewport (klienten sender pvw/pvh), så interscroll-kreativer
+//              FYLDER naturligt (via "contain") i stedet for at få slørede
+//              letterbox-bånd. Kreativet er UÆNDRET — ingen beskæring, ingen
+//              ændrede indstillinger; kun vores viewport tilpasses. Kun preview.
+//              (3.2 forsøgte at beskære kreativet med "cover" — KASSERET, aldrig
+//              deployet, fordi det ændrede hvordan kreativet vises.)
 // 3.1-preview  Tilføjet "Preview only"-tilstand (isoleret, kun ved preview:1):
 //              motoren renderer Adnamis egen preview-side og stripper dens
 //              chrome væk, så kun kreativet vises på en neutral side. Live-stien
@@ -70,7 +77,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "3.1-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "3.3-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1854,6 +1861,9 @@ function setupLive(httpServer) {
           const dev = DEVICES[msg.device] || DEVICES[DEFAULT_DEVICE];
           let vw = dev.w, vh = dev.h;
           if (dev.mobile && msg.landscape) { vw = dev.h; vh = dev.w; }
+          // Preview only: render at the viewport the client asks for (matched to Adnami's own preview
+          // viewport) so the creative fills naturally — WITHOUT cropping or altering the creative.
+          if (previewMode && Number(msg.pvw) > 0 && Number(msg.pvh) > 0) { vw = Number(msg.pvw); vh = Number(msg.pvh); }
 
           manualConsent = msg.consent === "manual";
           // Per-session quality/sharpness (client can trade smoothness ↔ sharpness).
