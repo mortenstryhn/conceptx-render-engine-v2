@@ -6,11 +6,20 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
-// 3.3-preview  Preview only: renderer nu i en viewport der matcher Adnamis egen
-//              preview-viewport (klienten sender pvw/pvh), så interscroll-kreativer
-//              FYLDER naturligt (via "contain") i stedet for at få slørede
-//              letterbox-bånd. Kreativet er UÆNDRET — ingen beskæring, ingen
-//              ændrede indstillinger; kun vores viewport tilpasses. Kun preview.
+// 3.4-preview  Preview only: fjerner Adnamis EGNE slørede fyld-bånd i toppen og
+//              bunden af deres telefon-mockup (#adnm-iphone-top / #adnm-iphone-
+//              bottom). Disse er præsentations-chrome — Adnami maler dem som
+//              zoomede, slørede kopier for at fylde mockup-skærmen ud, når et
+//              kreativ er lavere end skærmen (fx bbc47909: kreativet er 368×625,
+//              aspect 0.589). De ligger i en SELVSTÆNDIG DOM-gren og rører IKKE
+//              selve kreativ-iframen (#adsm-iframe…). Vi skjuler dem på samme måde
+//              som vi allerede skjuler havbaggrunden og theme-switcheren — så kun
+//              kreativet vises. Virker for ALLE aspect-forhold (i modsætning til
+//              3.3's viewport-match, som var skrøbelig pr. kreativ). Kreativet er
+//              UÆNDRET. Kun preview — Live er urørt.
+// 3.3-preview  Preview only: renderede i en viewport der forsøgte at matche
+//              Adnamis preview-viewport (pvw/pvh). Skrøbeligt: aspect varierer pr.
+//              kreativ, så bånd blev tilbage. Erstattet af 3.4's strip-skjul.
 //              (3.2 forsøgte at beskære kreativet med "cover" — KASSERET, aldrig
 //              deployet, fordi det ændrede hvordan kreativet vises.)
 // 3.1-preview  Tilføjet "Preview only"-tilstand (isoleret, kun ved preview:1):
@@ -77,7 +86,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "3.3-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "3.4-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1750,6 +1759,9 @@ function previewStripInit() {
     "#theme-switcher,.theme-switcher-control,[id*='theme-switcher'],[class*='theme-switcher']," +
     ".qrcode-container,[class*='qrcode'],#mobile-view-toggle,[id*='mobile-view-toggle']," +
     ".mobile-background,[class*='mobile-background']," +
+    // Adnamis slørede fyld-bånd i telefon-mockuppen (top/bund). Selvstændig gren —
+    // rører IKKE kreativ-iframen. Fjerner præcis de sløringer brugeren markerede.
+    "#adnm-iphone-top,#adnm-iphone-bottom,[id*='iphone-top'],[id*='iphone-bottom']," +
     "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
     ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}";
   function inject() {
