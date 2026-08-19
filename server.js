@@ -6,6 +6,17 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 3.5-preview  Preview only (mulighed A): lader kreativet FYLDE hele visningen i stedet
+//              for at efterlade bånd. Rod-årsag (verificeret i Adnamis DOM): Adnamis mobil-
+//              mockup viser kreativet i et fast vindue (fx 368x673) og fylder resten af
+//              telefon-skærmen ud med slørede fyld-bånd (#adnm-iphone-top/-bottom). Vi
+//              skjuler nu ALT mockup-chrome (bånd + selve telefon-rammen + havbaggrund) og
+//              strækker Adnamis eget vindue (#adnm-iphone / -viewport / -scrollbar-handler)
+//              til hele viewporten. Adnamis egen resize-handler måler så det RESPONSIVE
+//              kreativ om, så det fylder vinduet edge-to-edge (verificeret: hele kreativ-
+//              kæden 368x673 -> fuld viewport, uforvrænget, ingen bånd). Kreativet ændres
+//              ikke. Vores frontend tegner selv telefon-rammen, så Adnamis indre ramme er
+//              overflødig. Kun preview — Live er urørt.
 // 3.4-preview  Preview only: fjerner Adnamis EGNE slørede fyld-bånd i toppen og
 //              bunden af deres telefon-mockup (#adnm-iphone-top / #adnm-iphone-
 //              bottom). Disse er præsentations-chrome — Adnami maler dem som
@@ -86,7 +97,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "3.4-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "3.5-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1754,21 +1765,45 @@ const PREVIEW_HOST = "preview.adnami.io";
 // background layers, because some formats (interscroll/midscroll/doublescreen) ARE big fixed layers
 // and a generic "hide big empty layers" sweep would wipe the creative itself.
 function previewStripInit() {
-  var CSS =
+  // (1) SKJUL Adnamis præsentations-chrome. Intet af dette er kreativet: havbaggrund,
+  //     de slørede fyld-bånd (top/bund), selve telefon-rammen (::before/::after), theme-
+  //     switcher, QR-kode, consent. (Vores egen frontend tegner allerede en telefon-ramme,
+  //     så Adnamis indre mockup-ramme skal væk — ellers får vi ramme-i-ramme.)
+  var HIDE =
     ".page-header-theme-switcher,.page-header-meta,.page-header,[class*='page-header']," +
     "#theme-switcher,.theme-switcher-control,[id*='theme-switcher'],[class*='theme-switcher']," +
     ".qrcode-container,[class*='qrcode'],#mobile-view-toggle,[id*='mobile-view-toggle']," +
     ".mobile-background,[class*='mobile-background']," +
-    // Adnamis slørede fyld-bånd i telefon-mockuppen (top/bund). Selvstændig gren —
-    // rører IKKE kreativ-iframen. Fjerner præcis de sløringer brugeren markerede.
     "#adnm-iphone-top,#adnm-iphone-bottom,[id*='iphone-top'],[id*='iphone-bottom']," +
+    "#adnm-iphone::before,#adnm-iphone::after," +
     "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
     ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}";
+  // (2) LAD KREATIVET FYLDE. Adnamis mockup viser normalt kreativet i et fast vindue
+  //     (fx 368x673) med slørede bånd rundt om. Vi strækker vinduet til hele viewporten;
+  //     Adnamis egen resize-handler måler så det RESPONSIVE kreativ om, så det fylder vinduet
+  //     (verificeret: 368x673 -> fuld viewport, ingen bånd, kreativet uforvrænget). Kreativet
+  //     ændres IKKE — det er responsivt og fylder blot det vindue det får. Kun preview.
+  var FILL =
+    "#adnm-iphone{position:fixed !important;top:0 !important;left:0 !important;right:0 !important;bottom:0 !important;" +
+      "width:100% !important;height:100% !important;margin:0 !important;padding:0 !important;" +
+      "background:none !important;border:none !important;box-shadow:none !important;border-radius:0 !important;}" +
+    "#adnm-iphone-viewport,#adnm-iphone-scrollbar-handler{top:0 !important;left:0 !important;" +
+      "width:100% !important;height:100% !important;max-height:none !important;max-width:none !important;" +
+      "border-radius:0 !important;}";
+  var CSS = HIDE + FILL;
+  var nudges = 0;
+  function nudge() {
+    // Puf Adnamis resize-handler, så den remåler kreativet til det udvidede vindue.
+    if (nudges > 18) return; nudges++;
+    try { window.dispatchEvent(new Event("resize")); } catch (e) {}
+  }
   function inject() {
-    if (document.getElementById("cx-strip")) return;
-    var s = document.createElement("style");
-    s.id = "cx-strip"; s.textContent = CSS;
-    (document.head || document.documentElement).appendChild(s);
+    if (!document.getElementById("cx-strip")) {
+      var s = document.createElement("style");
+      s.id = "cx-strip"; s.textContent = CSS;
+      (document.head || document.documentElement).appendChild(s);
+    }
+    nudge();
   }
   inject();
   document.addEventListener("DOMContentLoaded", inject);
