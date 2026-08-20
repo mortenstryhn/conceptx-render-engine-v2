@@ -6,6 +6,12 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 4.8-mobilebg-fix  Preview only: DEN RIGTIGE FIX. Bisectede live og fandt at skjul-reglen
+//              '.mobile-background,[class*=mobile-background]' var synderen: for takeover-kreativer
+//              (canvasmobile, fx Lotto/be455b06) ER '.mobile-background' selve kreativets container,
+//              så vi skjulte annoncen → kun rødt frame. Fjernet den regel. Verificeret live: så
+//              renderer Lotto. (Diagnose-hooks + SwiftShader beholdt indtil du bekræfter; ryddes/
+//              testes bagefter.) Kun preview; Live urørt.
 // 4.7-diag-testcss  Preview only: VERIFICERET at previewStripInit (chrome-skjuleren) er det, der
 //              gør be455b06 (Lotto) rød — samme URL i Live-tilstand (uden skjuler) renderer fint.
 //              Genindsat live CSS-test ({t:"testcss"}) for at bisecte hvilken skjul-regel der rammer
@@ -166,7 +172,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "4.7-diag-testcss";                                      // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.8-mobilebg-fix";                                      // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1857,7 +1863,9 @@ function previewStripInit() {
     ".page-header-theme-switcher,.page-header-meta,.page-header,[class*='page-header']," +
     "#theme-switcher,.theme-switcher-control,[id*='theme-switcher'],[class*='theme-switcher']," +
     ".qrcode-container,[class*='qrcode'],#mobile-view-toggle,[id*='mobile-view-toggle']," +
-    ".mobile-background,[class*='mobile-background']," +
+    // BEMÆRK: vi skjuler IKKE '.mobile-background' længere. For takeover-kreativer (fx Lotto/
+    // be455b06, format canvasmobile) er '.mobile-background' selve KREATIVETS container — at skjule
+    // den efterlod kun det røde baggrunds-frame. Verificeret live: fjernes reglen, renderer kreativet.
     "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
     ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}";
   // BEVIDST INGEN højde-clamp (rullet tilbage efter ønske). Vi lader Adnamis naturlige mobil-
