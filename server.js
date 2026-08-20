@@ -6,6 +6,11 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 3.7-preview  Preview only: samme rendering som 3.6 (uændret adfærd) + et SIKKERT diagnose-
+//              værktøj. Når klienten sender {t:"dumpdom"} i preview, returnerer motoren de
+//              synlige elementer i/omkring viewporten ({t:"dbg", dom}) — element-navne, størrelser
+//              og position i motorens FAKTISKE mobil-render. Så kan vi ramme de rigtige content-
+//              elementer præcist i stedet for at gætte. Inert uden dumpdom. Live er urørt.
 // 3.6-preview  Preview only (mulighed A — TILBAGERULNING): fjerner 3.4's skjul af "bånd"
 //              (#adnm-iphone-top/-bottom) og 3.5's force-fill af vinduet. De ramte elementer
 //              fra Adnamis DESKTOP-mockup, som IKKE findes i motorens mobil-render (mobil UA),
@@ -106,7 +111,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "3.6-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "3.7-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1800,6 +1805,36 @@ function previewStripInit() {
 }
 async function applyPreviewStrip(page) { try { await page.evaluate(previewStripInit); } catch {} }
 
+// DIAGNOSTIK (kun preview): dumper de synlige elementer i/omkring viewporten, så vi kan
+// se motorens FAKTISKE mobil-DOM (element-navne, størrelser, position) — uden at gætte.
+// Køres kun når klienten sender {t:"dumpdom"}. Ændrer intet på siden. Live røres aldrig.
+async function dumpPreviewDom(page) {
+  try {
+    return await page.evaluate(() => {
+      var out = [];
+      var vh = window.innerHeight, vw = window.innerWidth;
+      out.push("VIEWPORT " + vw + "x" + vh + " scrollY=" + Math.round(window.scrollY));
+      var all = document.querySelectorAll("*");
+      for (var i = 0; i < all.length && out.length < 500; i++) {
+        var el = all[i];
+        var r = el.getBoundingClientRect();
+        if (r.height < 18 || r.width < 30) continue;
+        if (r.bottom < -150 || r.top > vh + 150) continue;
+        var cs = getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity) === 0) continue;
+        var tag = el.tagName.toLowerCase();
+        var id = el.id ? ("#" + el.id) : "";
+        var cls = (el.className && typeof el.className === "string")
+          ? ("." + el.className.trim().split(/\s+/).slice(0, 2).join(".")) : "";
+        var bg = (cs.backgroundImage && cs.backgroundImage !== "none") ? " BGIMG" : "";
+        out.push(tag + id + cls + " [" + Math.round(r.width) + "x" + Math.round(r.height) +
+                 " @top=" + Math.round(r.top) + "] " + cs.position + bg);
+      }
+      return out.join("\n");
+    });
+  } catch (e) { return "dump err: " + (e && e.message); }
+}
+
 function setupLive(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: "/live" });
 
@@ -1817,6 +1852,7 @@ function setupLive(httpServer) {
     liveCount++;
     METRICS.live.active++; METRICS.live.total++;
     let context = null, page = null, cdp = null, closed = false, started = false;
+    let previewSession = false;        // true when this is a "Preview only" session (enables dumpdom diag)
     let liveReady = false, navSeq = 0; // liveReady: initial load done → re-run consent+ads on later link-clicks
     let idleTimer = null;
     let manualConsent = false;
@@ -1893,6 +1929,7 @@ function setupLive(httpServer) {
         if (msg.t === "start") {
           if (started) return; started = true;
           const previewMode = !!msg.preview; // "Preview only" (Tilstand): Adnami page + strip chrome
+          previewSession = previewMode;
           const dev = DEVICES[msg.device] || DEVICES[DEFAULT_DEVICE];
           let vw = dev.w, vh = dev.h;
           if (dev.mobile && msg.landscape) { vw = dev.h; vh = dev.w; }
@@ -2018,6 +2055,11 @@ function setupLive(httpServer) {
           if (previewMode) await applyPreviewStrip(page);   // preview: show only the creative on a neutral page
           else await doInject();
           liveReady = true;   // initial page done → clicking to a new article now re-runs consent+ads
+        }
+        else if (msg.t === "dumpdom") {
+          // Diagnostik (kun preview): send motorens faktiske mobil-DOM tilbage. Ændrer intet.
+          if (previewSession && page) { const dom = await dumpPreviewDom(page); send({ t: "dbg", dom }); }
+          return;
         }
         else if (!page) { return; }
         else {
