@@ -6,6 +6,11 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 4.2-preview  Preview only: DIAGNOSE mod auto-tilpasning. Beholder 4.1's 673-fix (bbc47909
+//              virker fortsat) + tilføjer en postMessage-lytter i Adnami-siden ({t:"dumpmsgs"}),
+//              så vi kan se hvordan Adnami melder hvert kreativs højde. Formål: erstatte den
+//              hardkodede 673 med en AUTO-højde pr. kreativ, så dobbelt-scroll-formater (fx
+//              be455b06) ikke længere klemmes. Inert uden dumpmsgs. Kun preview; Live urørt.
 // 4.1-preview  Preview only: fikser VIDEO-fasen. Brugeren så bånd de første ~15-20 s (mens
 //              videoen spiller), hvorefter formatet faldt på plads i 673. Årsag (verificeret i
 //              motorens DOM): under video går interscroll'en i fuldskærms-takeover — Adnami sætter
@@ -138,7 +143,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "4.1-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.2-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1862,6 +1867,26 @@ function previewStripInit() {
 }
 async function applyPreviewStrip(page) { try { await page.evaluate(previewStripInit); } catch {} }
 
+// DIAGNOSTIK (kun preview): opsnap postMessages i Adnami-siden (annoncen melder ofte sin
+// størrelse hertil via postMessage). Installeres via addInitScript FØR sidens egen JS, så vi
+// fanger alt. Gemmer på window.__cxmsgs; hentes med {t:"dumpmsgs"}. Ændrer intet på siden.
+function previewMsgSniffer() {
+  try {
+    if (window.__cxmsgs) return;
+    window.__cxmsgs = [];
+    window.addEventListener("message", function (e) {
+      try {
+        var d = e.data;
+        var s = (typeof d === "string") ? d : JSON.stringify(d);
+        if (s == null) return;
+        if (s.length > 500) s = s.slice(0, 500);
+        window.__cxmsgs.push({ o: String(e.origin || "").slice(0, 70), d: s });
+        if (window.__cxmsgs.length > 80) window.__cxmsgs.shift();
+      } catch (x) {}
+    }, false);
+  } catch (x) {}
+}
+
 // DIAGNOSTIK (kun preview): injicér/erstat en test-<style> i preview-siden, så vi kan finjustere
 // annonce-feltets CSS mod den kørende motor UDEN at deploye igen. Kun CSS (ingen scripts). Live røres aldrig.
 async function applyTestCss(page, css) {
@@ -2040,6 +2065,7 @@ function setupLive(httpServer) {
           }
           // Preview only: strip Adnami's chrome from the first paint and keep it stripped.
           if (previewMode) { try { await context.addInitScript(previewStripInit); } catch {} }
+          if (previewMode) { try { await context.addInitScript(previewMsgSniffer); } catch {} }
           page = await context.newPage();
 
           // Fold "open in new tab" popups back into the main tab.
@@ -2133,6 +2159,14 @@ function setupLive(httpServer) {
         else if (msg.t === "testcss") {
           // Diagnostik (kun preview): live-finjuster annonce-feltets CSS uden ny deploy.
           if (previewSession && page && typeof msg.css === "string") { await applyTestCss(page, msg.css); }
+          return;
+        }
+        else if (msg.t === "dumpmsgs") {
+          // Diagnostik (kun preview): send de opsnappede postMessages (annoncens størrelses-signal).
+          if (previewSession && page) {
+            let msgs = []; try { msgs = await page.evaluate(() => window.__cxmsgs || []); } catch {}
+            send({ t: "dbgmsgs", msgs });
+          }
           return;
         }
         else if (!page) { return; }
