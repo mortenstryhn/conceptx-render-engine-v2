@@ -6,6 +6,13 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 3.8-preview  Preview only: FIX af bånd (mulighed A, præcist). Motorens mobil-DOM afslørede
+//              at Adnami sætter interscroll-slotten (#adunit-incontent) og kreativ-rammen til
+//              fuld viewport-højde (fx 890), mens kreativet er bygget til 673 → letterbox-bånd
+//              INDE i den for-høje ramme. Vi tvinger slot+ramme+iframe til 673 px, så kreativet
+//              fylder rammen, og artikel-indhold flyder rundt om. Kreativets eget indhold (cross-
+//              origin) røres ikke. Beholder dumpdom + tilføjer testcss (live CSS-finjustering uden
+//              ny deploy). Kun preview — Live er urørt.
 // 3.7-preview  Preview only: samme rendering som 3.6 (uændret adfærd) + et SIKKERT diagnose-
 //              værktøj. Når klienten sender {t:"dumpdom"} i preview, returnerer motoren de
 //              synlige elementer i/omkring viewporten ({t:"dbg", dom}) — element-navne, størrelser
@@ -111,7 +118,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "3.7-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "3.8-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1785,18 +1792,30 @@ function previewStripInit() {
   // + annonce i sin rigtige højde + artikel) får lov at komme frem urørt. 3.4's strip-skjul og
   // 3.5's force-fill er fjernet, fordi de ramte desktop-elementer der ikke findes i motorens
   // mobil-render og forvred layoutet.
-  var CSS =
+  var HIDE =
     ".page-header-theme-switcher,.page-header-meta,.page-header,[class*='page-header']," +
     "#theme-switcher,.theme-switcher-control,[id*='theme-switcher'],[class*='theme-switcher']," +
     ".qrcode-container,[class*='qrcode'],#mobile-view-toggle,[id*='mobile-view-toggle']," +
     ".mobile-background,[class*='mobile-background']," +
     "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
     ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}";
+  // ANNONCE-FELTET → 673 px. Motorens mobil-DOM viser: Adnami sætter interscroll-slotten
+  // (#adunit-incontent) og kreativ-rammen til FULD viewport-højde (fx 890 px), men selve
+  // kreativet er bygget til 673 px og letterboxer derfor (slørede/tomme bånd) i den for-høje
+  // ramme. Vi sætter slotten + rammen + iframen til 673 px, så kreativet fylder rammen præcist,
+  // og artikel-indholdet flyder rundt om. Vi rører IKKE kreativets eget indhold (cross-origin
+  // iframe) — kun feltets/rammens højde. Kun mobil-interscroll; kun preview.
+  var ADH = 673;
+  var SLOT =
+    "#adunit-incontent,.adunit,.adnm-creative,.adnm-html-interscroll-frame-wrapper," +
+    ".adnm-html-interscroll-frame,.adnm-html-interscroll-container,.adnm-html-interscroll-tag," +
+    "iframe[id^='adsm-iframe']" +
+    "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;min-height:0 !important;}";
+  var CSS = HIDE + SLOT;
   function inject() {
-    if (document.getElementById("cx-strip")) return;
-    var s = document.createElement("style");
-    s.id = "cx-strip"; s.textContent = CSS;
-    (document.head || document.documentElement).appendChild(s);
+    var s = document.getElementById("cx-strip");
+    if (!s) { s = document.createElement("style"); s.id = "cx-strip"; (document.head || document.documentElement).appendChild(s); }
+    s.textContent = CSS;
   }
   inject();
   document.addEventListener("DOMContentLoaded", inject);
@@ -1804,6 +1823,18 @@ function previewStripInit() {
   var n = 0, iv = setInterval(function () { inject(); if (++n > 50) clearInterval(iv); }, 400); // ~20s safety net
 }
 async function applyPreviewStrip(page) { try { await page.evaluate(previewStripInit); } catch {} }
+
+// DIAGNOSTIK (kun preview): injicér/erstat en test-<style> i preview-siden, så vi kan finjustere
+// annonce-feltets CSS mod den kørende motor UDEN at deploye igen. Kun CSS (ingen scripts). Live røres aldrig.
+async function applyTestCss(page, css) {
+  try {
+    await page.evaluate((c) => {
+      var s = document.getElementById("cx-test");
+      if (!s) { s = document.createElement("style"); s.id = "cx-test"; (document.head || document.documentElement).appendChild(s); }
+      s.textContent = c || "";
+    }, css);
+  } catch (e) {}
+}
 
 // DIAGNOSTIK (kun preview): dumper de synlige elementer i/omkring viewporten, så vi kan
 // se motorens FAKTISKE mobil-DOM (element-navne, størrelser, position) — uden at gætte.
@@ -2059,6 +2090,11 @@ function setupLive(httpServer) {
         else if (msg.t === "dumpdom") {
           // Diagnostik (kun preview): send motorens faktiske mobil-DOM tilbage. Ændrer intet.
           if (previewSession && page) { const dom = await dumpPreviewDom(page); send({ t: "dbg", dom }); }
+          return;
+        }
+        else if (msg.t === "testcss") {
+          // Diagnostik (kun preview): live-finjuster annonce-feltets CSS uden ny deploy.
+          if (previewSession && page && typeof msg.css === "string") { await applyTestCss(page, msg.css); }
           return;
         }
         else if (!page) { return; }
