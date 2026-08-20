@@ -6,6 +6,12 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 4.0-preview  Preview only: STABILITET. Samme 673-fix som 3.9, men retter en fejl JEG lavede
+//              i 3.9: CSS-injektionen kørte om ved HVER DOM-ændring (MutationObserver uden guard),
+//              hvilket under en video-annonce (tusindvis af mutationer) hamrede CPU/hukommelse og
+//              forværrede motorens memory-restarts. Nu sættes <style>'et ÉN gang (en stylesheet
+//              gælder globalt, også for senere elementer), og observer/interval stopper straks
+//              efter. Reducerer motorens load markant. Selve bånd-fixet er uændret. Kun preview.
 // 3.9-preview  Preview only: FÆRDIG fix af bånd — VERIFICERET live mod den kørende motor.
 //              3.8 fejlede fordi interscroll-elementerne er absolut/fixed-positionerede: height
 //              alene blev ignoreret. Løsning: sæt top:0 + bottom:auto SAMMEN med height:673 på
@@ -124,7 +130,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "3.9-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.0-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1824,15 +1830,22 @@ function previewStripInit() {
     "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;" +
     "top:0 !important;bottom:auto !important;}";
   var CSS = HIDE + SLOT;
+  // EFFEKTIV injektion: <style>'et sættes ÉN gang. En stylesheet gælder globalt — også for
+  // elementer Adnami tilføjer bagefter — så vi behøver IKKE at gen-sætte den ved hver DOM-ændring.
+  // (3.9 gjorde netop det og hamrede CPU/hukommelse under video → forværrede motorens OOM.)
   function inject() {
-    var s = document.getElementById("cx-strip");
-    if (!s) { s = document.createElement("style"); s.id = "cx-strip"; (document.head || document.documentElement).appendChild(s); }
-    s.textContent = CSS;
+    if (document.getElementById("cx-strip")) return;   // allerede sat → billig exit, ingen hamring
+    var s = document.createElement("style");
+    s.id = "cx-strip"; s.textContent = CSS;
+    (document.head || document.documentElement).appendChild(s);
   }
   inject();
   document.addEventListener("DOMContentLoaded", inject);
-  try { new MutationObserver(inject).observe(document.documentElement || document, { childList: true, subtree: true }); } catch (e) {}
-  var n = 0, iv = setInterval(function () { inject(); if (++n > 50) clearInterval(iv); }, 400); // ~20s safety net
+  var obs; try { obs = new MutationObserver(function () {
+    if (document.getElementById("cx-strip")) { try { obs.disconnect(); } catch (e) {} return; }
+    inject();
+  }); obs.observe(document.documentElement || document, { childList: true, subtree: true }); } catch (e) {}
+  var n = 0, iv = setInterval(function () { inject(); if (document.getElementById("cx-strip") || ++n > 25) clearInterval(iv); }, 400);
 }
 async function applyPreviewStrip(page) { try { await page.evaluate(previewStripInit); } catch {} }
 
