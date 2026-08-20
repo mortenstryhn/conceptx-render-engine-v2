@@ -6,6 +6,12 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 3.9-preview  Preview only: FÆRDIG fix af bånd — VERIFICERET live mod den kørende motor.
+//              3.8 fejlede fordi interscroll-elementerne er absolut/fixed-positionerede: height
+//              alene blev ignoreret. Løsning: sæt top:0 + bottom:auto SAMMEN med height:673 på
+//              #adunit-incontent / .adnm-html-interscroll-tag/-frame/-container / -frame-wrapper /
+//              iframe[id^=adsm-iframe]. Så fylder kreativet præcis 673 px (ingen bånd) og artikel-
+//              indholdet flyder rundt om. Kreativets indhold (cross-origin) røres ikke. Kun preview.
 // 3.8-preview  Preview only: FIX af bånd (mulighed A, præcist). Motorens mobil-DOM afslørede
 //              at Adnami sætter interscroll-slotten (#adunit-incontent) og kreativ-rammen til
 //              fuld viewport-højde (fx 890), mens kreativet er bygget til 673 → letterbox-bånd
@@ -118,7 +124,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "3.8-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "3.9-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1805,12 +1811,18 @@ function previewStripInit() {
   // ramme. Vi sætter slotten + rammen + iframen til 673 px, så kreativet fylder rammen præcist,
   // og artikel-indholdet flyder rundt om. Vi rører IKKE kreativets eget indhold (cross-origin
   // iframe) — kun feltets/rammens højde. Kun mobil-interscroll; kun preview.
+  // VERIFICERET live mod den kørende motor: elementerne er absolut/fixed-positionerede, så
+  // height alene ignoreres — vi SKAL også nulstille top/bottom, ellers holder de 890 px. Med
+  // top:0 + bottom:auto + height:673 fylder kreativet præcis 673 px, og artikel-indholdet flyder
+  // rundt om. Kreativet re-renderer selv responsivt, når iframen skifter højde.
   var ADH = 673;
   var SLOT =
-    "#adunit-incontent,.adunit,.adnm-creative,.adnm-html-interscroll-frame-wrapper," +
-    ".adnm-html-interscroll-frame,.adnm-html-interscroll-container,.adnm-html-interscroll-tag," +
+    "#adunit-incontent,.adnm-html-interscroll-frame-wrapper" +
+    "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;min-height:0 !important;}" +
+    ".adnm-html-interscroll-tag,.adnm-html-interscroll-frame,.adnm-html-interscroll-container," +
     "iframe[id^='adsm-iframe']" +
-    "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;min-height:0 !important;}";
+    "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;" +
+    "top:0 !important;bottom:auto !important;}";
   var CSS = HIDE + SLOT;
   function inject() {
     var s = document.getElementById("cx-strip");
