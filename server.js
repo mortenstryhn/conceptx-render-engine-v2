@@ -6,6 +6,13 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 4.6-preview-topframe  Preview only: FIX — chrome-skjuleren (previewStripInit) begrænses til KUN
+//              at køre i topframen (preview.adnami.io), ikke inde i kreativets cross-origin iframe.
+//              Brugerens indsigt: samme kreativ (Lotto/be455b06) renderer PERFEKT i Live-tilstand,
+//              men kun rødt i Preview only — samme motor. Eneste rendering-forskel var previewStrip-
+//              Init, som via addInitScript kørte i ALLE frames, også inde i annoncen, og forstyrrede
+//              dens animation. Nu kører den kun på selve preview-siden. (Behold også console-diag
+//              {t:"dumpconsole"} og SwiftShader indtil fixet er bekræftet.) Kun preview; Live urørt.
 // 4.4-swiftshader  Motoren: slået SOFTWARE-GRAFIK til (SwiftShader via ANGLE) i stedet for
 //              "--disable-gpu", så canvas/WebGL-animations-kreativer (format "canvasmobile", fx
 //              Lotto/be455b06) kan rendere uden fysisk GPU. Tidligere viste de kun et rødt/tomt
@@ -155,7 +162,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "4.4-swiftshader";                                       // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.6-preview-topframe";                                  // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1831,6 +1838,11 @@ const PREVIEW_HOST = "preview.adnami.io";
 // background layers, because some formats (interscroll/midscroll/doublescreen) ARE big fixed layers
 // and a generic "hide big empty layers" sweep would wipe the creative itself.
 function previewStripInit() {
+  // KUN i topframen (selve preview.adnami.io-siden). addInitScript kører i ALLE frames — også inde
+  // i kreativets egen (cross-origin) iframe — og der har chrome-skjuleren intet at gøre; dens
+  // observer/CSS kan forstyrre kreativets animation (fx canvasmobile/Lotto, som ellers kun viste
+  // rødt i preview only, men renderede fint i Live). Vi rører derfor kun hovedsiden.
+  try { if (window.top !== window.self) return; } catch (e) { return; }
   // TILBAGERULLET (mulighed A): skjuler KUN Adnamis preview-værktøjs-widgets (theme-switcher,
   // QR-kode, "view on mobile", page-header, consent) — IKKE artikel-indholdet, IKKE de såkaldte
   // "bånd", og INGEN tvungen udfyldning af vinduet. Adnamis eget naturlige mobil-layout (artikel
@@ -1880,6 +1892,8 @@ function setupLive(httpServer) {
     liveCount++;
     METRICS.live.active++; METRICS.live.total++;
     let context = null, page = null, cdp = null, closed = false, started = false;
+    let dbgOn = false; const dbgLog = [];   // DIAG (kun preview): console/pageerror-opsamling til {t:"dumpconsole"}
+    const dbgPush = (s) => { try { dbgLog.push(String(s).slice(0, 300)); if (dbgLog.length > 200) dbgLog.shift(); } catch {} };
     let liveReady = false, navSeq = 0; // liveReady: initial load done → re-run consent+ads on later link-clicks
     let idleTimer = null;
     let manualConsent = false;
@@ -1997,7 +2011,15 @@ function setupLive(httpServer) {
           }
           // Preview only: strip Adnami's chrome from the first paint and keep it stripped.
           if (previewMode) { try { await context.addInitScript(previewStripInit); } catch {} }
+          dbgOn = previewMode;
           page = await context.newPage();
+          if (dbgOn) {
+            try {
+              page.on("console", (m) => { try { dbgPush("[" + m.type() + "] " + m.text()); } catch {} });
+              page.on("pageerror", (e) => dbgPush("[pageerror] " + (e && e.message)));
+              page.on("requestfailed", (r) => { try { dbgPush("[reqfail] " + r.failure()?.errorText + " " + r.url().slice(0, 120)); } catch {} });
+            } catch {}
+          }
 
           // Fold "open in new tab" popups back into the main tab.
           context.on("page", async (pg) => {
@@ -2081,6 +2103,25 @@ function setupLive(httpServer) {
           if (previewMode) await applyPreviewStrip(page);   // preview: show only the creative on a neutral page
           else await doInject();
           liveReady = true;   // initial page done → clicking to a new article now re-runs consent+ads
+        }
+        else if (msg.t === "dumpconsole") {
+          // DIAG (kun preview): send motorens console/pageerror + WebGL-status tilbage.
+          if (dbgOn && page) {
+            let webgl = "?";
+            try {
+              webgl = await page.evaluate(() => {
+                try {
+                  var c = document.createElement("canvas");
+                  var gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+                  if (!gl) return "NO-WEBGL";
+                  var d = gl.getExtension("WEBGL_debug_renderer_info");
+                  return d ? String(gl.getParameter(d.UNMASKED_RENDERER_WEBGL)) : "WEBGL-OK";
+                } catch (e) { return "err " + (e && e.message); }
+              });
+            } catch {}
+            send({ t: "dbgconsole", webgl, log: dbgLog });
+          }
+          return;
         }
         else if (!page) { return; }
         else {
