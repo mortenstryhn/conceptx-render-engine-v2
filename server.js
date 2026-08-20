@@ -6,6 +6,11 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 4.9-clean    Preview only: OPRYDNING + performance. Beholder 4.8's rigtige fix (mobile-background
+//              fjernet fra skjuleren). Rullet SwiftShader tilbage til "--disable-gpu" (det var en
+//              blindgyde — problemet var skjuleren, ikke GPU; software-grafik gjorde bare afspilning
+//              hakkende) → den delte motor er nu urørt igen. Fjernet ALLE diagnose-hooks (testcss/
+//              dumpconsole/console-lyttere) som også kostede performance. Ren version. Live urørt.
 // 4.8-mobilebg-fix  Preview only: DEN RIGTIGE FIX. Bisectede live og fandt at skjul-reglen
 //              '.mobile-background,[class*=mobile-background]' var synderen: for takeover-kreativer
 //              (canvasmobile, fx Lotto/be455b06) ER '.mobile-background' selve kreativets container,
@@ -172,7 +177,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "4.8-mobilebg-fix";                                      // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.9-clean";                                             // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -451,15 +456,7 @@ async function getBrowser() {
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
-        // Software-grafik (SwiftShader via ANGLE): så canvas/WebGL-animations-kreativer (fx format
-        // "canvasmobile", som Lotto/be455b06) kan rendere UDEN en fysisk GPU. Erstatter det tidligere
-        // "--disable-gpu", der slog al grafik fra og efterlod animerede kreativer som tomme/røde
-        // placeholders. Video-kreativer (fx bbc47909) påvirkes ikke. Software-grafik bruger lidt flere
-        // ressourcer. Reversibelt: fjern de fire linjer og sæt "--disable-gpu" tilbage for at slå fra.
-        "--use-gl=angle",
-        "--use-angle=swiftshader",
-        "--enable-unsafe-swiftshader",
-        "--ignore-gpu-blocklist",
+        "--disable-gpu",
         // Let ad video autoplay without a user gesture, muted (we never stream audio anyway).
         "--autoplay-policy=no-user-gesture-required",
         "--mute-audio",
@@ -1887,18 +1884,6 @@ function previewStripInit() {
 }
 async function applyPreviewStrip(page) { try { await page.evaluate(previewStripInit); } catch {} }
 
-// DIAG (kun preview): live CSS-test uden ny deploy — bruges til at bisecte hvilken skjul-regel der
-// rammer kreativet. Kun CSS. Live røres aldrig.
-async function applyTestCss(page, css) {
-  try {
-    await page.evaluate((c) => {
-      var s = document.getElementById("cx-test");
-      if (!s) { s = document.createElement("style"); s.id = "cx-test"; (document.head || document.documentElement).appendChild(s); }
-      s.textContent = c || "";
-    }, css);
-  } catch (e) {}
-}
-
 function setupLive(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: "/live" });
 
@@ -1916,8 +1901,6 @@ function setupLive(httpServer) {
     liveCount++;
     METRICS.live.active++; METRICS.live.total++;
     let context = null, page = null, cdp = null, closed = false, started = false;
-    let dbgOn = false; const dbgLog = [];   // DIAG (kun preview): console/pageerror-opsamling til {t:"dumpconsole"}
-    const dbgPush = (s) => { try { dbgLog.push(String(s).slice(0, 300)); if (dbgLog.length > 200) dbgLog.shift(); } catch {} };
     let liveReady = false, navSeq = 0; // liveReady: initial load done → re-run consent+ads on later link-clicks
     let idleTimer = null;
     let manualConsent = false;
@@ -2035,15 +2018,7 @@ function setupLive(httpServer) {
           }
           // Preview only: strip Adnami's chrome from the first paint and keep it stripped.
           if (previewMode) { try { await context.addInitScript(previewStripInit); } catch {} }
-          dbgOn = previewMode;
           page = await context.newPage();
-          if (dbgOn) {
-            try {
-              page.on("console", (m) => { try { dbgPush("[" + m.type() + "] " + m.text()); } catch {} });
-              page.on("pageerror", (e) => dbgPush("[pageerror] " + (e && e.message)));
-              page.on("requestfailed", (r) => { try { dbgPush("[reqfail] " + r.failure()?.errorText + " " + r.url().slice(0, 120)); } catch {} });
-            } catch {}
-          }
 
           // Fold "open in new tab" popups back into the main tab.
           context.on("page", async (pg) => {
@@ -2127,29 +2102,6 @@ function setupLive(httpServer) {
           if (previewMode) await applyPreviewStrip(page);   // preview: show only the creative on a neutral page
           else await doInject();
           liveReady = true;   // initial page done → clicking to a new article now re-runs consent+ads
-        }
-        else if (msg.t === "testcss") {
-          if (dbgOn && page && typeof msg.css === "string") { await applyTestCss(page, msg.css); }
-          return;
-        }
-        else if (msg.t === "dumpconsole") {
-          // DIAG (kun preview): send motorens console/pageerror + WebGL-status tilbage.
-          if (dbgOn && page) {
-            let webgl = "?";
-            try {
-              webgl = await page.evaluate(() => {
-                try {
-                  var c = document.createElement("canvas");
-                  var gl = c.getContext("webgl") || c.getContext("experimental-webgl");
-                  if (!gl) return "NO-WEBGL";
-                  var d = gl.getExtension("WEBGL_debug_renderer_info");
-                  return d ? String(gl.getParameter(d.UNMASKED_RENDERER_WEBGL)) : "WEBGL-OK";
-                } catch (e) { return "err " + (e && e.message); }
-              });
-            } catch {}
-            send({ t: "dbgconsole", webgl, log: dbgLog });
-          }
-          return;
         }
         else if (!page) { return; }
         else {
