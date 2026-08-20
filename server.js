@@ -6,6 +6,13 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 4.4-swiftshader  Motoren: slået SOFTWARE-GRAFIK til (SwiftShader via ANGLE) i stedet for
+//              "--disable-gpu", så canvas/WebGL-animations-kreativer (format "canvasmobile", fx
+//              Lotto/be455b06) kan rendere uden fysisk GPU. Tidligere viste de kun et rødt/tomt
+//              placeholder-frame, fordi grafik var slået helt fra. Video-kreativer uændret. NB:
+//              dette er en fælles motor-indstilling (ikke kun preview) — den TILFØJER kun grafik-
+//              kapacitet og ændrer ikke Live's flow. Bruger lidt flere ressourcer. EKSPERIMENT —
+//              skal verificeres mod be455b06 før det kaldes en løsning.
 // 4.3-preview  Preview only: RULLET 673-clamp TILBAGE (efter ønske) + ryddet alle diagnose-
 //              hooks væk (dumpdom/testcss/dumpmsgs/sniffer). previewStripInit skjuler nu KUN
 //              Adnamis preview-værktøjs-widgets; INGEN højde-begrænsning. Alle formater beholder
@@ -148,7 +155,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "4.3-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.4-swiftshader";                                       // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -427,7 +434,15 @@ async function getBrowser() {
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
+        // Software-grafik (SwiftShader via ANGLE): så canvas/WebGL-animations-kreativer (fx format
+        // "canvasmobile", som Lotto/be455b06) kan rendere UDEN en fysisk GPU. Erstatter det tidligere
+        // "--disable-gpu", der slog al grafik fra og efterlod animerede kreativer som tomme/røde
+        // placeholders. Video-kreativer (fx bbc47909) påvirkes ikke. Software-grafik bruger lidt flere
+        // ressourcer. Reversibelt: fjern de fire linjer og sæt "--disable-gpu" tilbage for at slå fra.
+        "--use-gl=angle",
+        "--use-angle=swiftshader",
+        "--enable-unsafe-swiftshader",
+        "--ignore-gpu-blocklist",
         // Let ad video autoplay without a user gesture, muted (we never stream audio anyway).
         "--autoplay-policy=no-user-gesture-required",
         "--mute-audio",
