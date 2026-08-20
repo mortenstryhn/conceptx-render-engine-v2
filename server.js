@@ -6,6 +6,11 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 4.3-preview  Preview only: RULLET 673-clamp TILBAGE (efter ønske) + ryddet alle diagnose-
+//              hooks væk (dumpdom/testcss/dumpmsgs/sniffer). previewStripInit skjuler nu KUN
+//              Adnamis preview-værktøjs-widgets; INGEN højde-begrænsning. Alle formater beholder
+//              deres naturlige scroll (også dobbelt-scroll-midscroll). Accepteret afvejning:
+//              lave formater kan vise slørede letterbox-bånd i top/bund. Ren version. Live urørt.
 // 4.2-preview  Preview only: DIAGNOSE mod auto-tilpasning. Beholder 4.1's 673-fix (bbc47909
 //              virker fortsat) + tilføjer en postMessage-lytter i Adnami-siden ({t:"dumpmsgs"}),
 //              så vi kan se hvordan Adnami melder hvert kreativs højde. Formål: erstatte den
@@ -143,7 +148,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "4.2-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.3-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1824,110 +1829,24 @@ function previewStripInit() {
     ".mobile-background,[class*='mobile-background']," +
     "#helpOverlay,#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter," +
     ".ot-sdk-container,#ot-sdk-btn-floating{display:none !important;}";
-  // ANNONCE-FELTET → 673 px. Motorens mobil-DOM viser: Adnami sætter interscroll-slotten
-  // (#adunit-incontent) og kreativ-rammen til FULD viewport-højde (fx 890 px), men selve
-  // kreativet er bygget til 673 px og letterboxer derfor (slørede/tomme bånd) i den for-høje
-  // ramme. Vi sætter slotten + rammen + iframen til 673 px, så kreativet fylder rammen præcist,
-  // og artikel-indholdet flyder rundt om. Vi rører IKKE kreativets eget indhold (cross-origin
-  // iframe) — kun feltets/rammens højde. Kun mobil-interscroll; kun preview.
-  // VERIFICERET live mod den kørende motor: elementerne er absolut/fixed-positionerede, så
-  // height alene ignoreres — vi SKAL også nulstille top/bottom, ellers holder de 890 px. Med
-  // top:0 + bottom:auto + height:673 fylder kreativet præcis 673 px, og artikel-indholdet flyder
-  // rundt om. Kreativet re-renderer selv responsivt, når iframen skifter højde.
-  // Under selve VIDEOEN går interscroll'en i fuldskærms-takeover: Adnami sætter .adnm-html-
-  // interscroll-tag / -frame / -container / iframe til FULD viewport-højde (890) via et stylesheet
-  // der loader EFTER vores → deres regel vandt rækkefølgen, så min 673 gjaldt først når det
-  // kollapsede (endcard) efter ~15-20 s. FIX: (1) DOBBELT-selektorer → højere specificitet, så min
-  // regel slår Adnamis !important-regel uanset rækkefølge; (2) hold <style>'et SIDST i <head>, så
-  // den også vinder på rækkefølge. Verificeret live: så bliver takeover-tag'en 673 med det samme.
-  var ADH = 673;
-  var box  = "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;min-height:0 !important;}";
-  var boxT = "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;min-height:0 !important;" +
-             "top:0 !important;bottom:auto !important;}";
-  var SLOT =
-    "#adunit-incontent#adunit-incontent" + box +
-    ".adnm-html-interscroll-frame-wrapper.adnm-html-interscroll-frame-wrapper" + box +
-    ".adnm-html-interscroll-tag.adnm-html-interscroll-tag" + boxT +
-    ".adnm-html-interscroll-frame.adnm-html-interscroll-frame" + boxT +
-    ".adnm-html-interscroll-container.adnm-html-interscroll-container" + boxT +
-    "iframe[id^='adsm-iframe'][id^='adsm-iframe']" + boxT;
-  var CSS = HIDE + SLOT;
-  // Placér <style>'et og HOLD det sidst i <head>, så det også vinder på cascade-rækkefølge, mens
-  // Adnami loader sine egne stylesheets under takeoveren. At flytte et element er billigt.
-  function place() {
-    var s = document.getElementById("cx-strip");
-    if (!s) { s = document.createElement("style"); s.id = "cx-strip"; }
-    if (s.textContent !== CSS) s.textContent = CSS;
-    var head = document.head || document.documentElement;
-    if (head && head.lastElementChild !== s) head.appendChild(s);   // keep it LAST
+  // BEVIDST INGEN højde-clamp (rullet tilbage efter ønske). Vi lader Adnamis naturlige mobil-
+  // layout stå: artikel + annonce i formatets EGEN højde + artikel. Det bevarer scroll-opførslen
+  // for ALLE formater — også dobbelt-scroll-midscroll (fx be455b06), som en fast 673-clamp ellers
+  // klemte. Prisen er, at visse formater (fx bbc47909) igen kan vise slørede letterbox-bånd i top/
+  // bund — det er en accepteret afvejning: korrekt scroll vægter højere end kosmetikken.
+  var CSS = HIDE;
+  function inject() {
+    if (document.getElementById("cx-strip")) return;
+    var s = document.createElement("style");
+    s.id = "cx-strip"; s.textContent = CSS;
+    (document.head || document.documentElement).appendChild(s);
   }
-  place();
-  document.addEventListener("DOMContentLoaded", place);
-  var n = 0, iv = setInterval(function () { place(); if (++n > 80) clearInterval(iv); }, 300); // ~24s (dækker video)
+  inject();
+  document.addEventListener("DOMContentLoaded", inject);
+  try { new MutationObserver(inject).observe(document.documentElement || document, { childList: true, subtree: true }); } catch (e) {}
+  var n = 0, iv = setInterval(function () { inject(); if (++n > 30) clearInterval(iv); }, 400);
 }
 async function applyPreviewStrip(page) { try { await page.evaluate(previewStripInit); } catch {} }
-
-// DIAGNOSTIK (kun preview): opsnap postMessages i Adnami-siden (annoncen melder ofte sin
-// størrelse hertil via postMessage). Installeres via addInitScript FØR sidens egen JS, så vi
-// fanger alt. Gemmer på window.__cxmsgs; hentes med {t:"dumpmsgs"}. Ændrer intet på siden.
-function previewMsgSniffer() {
-  try {
-    if (window.__cxmsgs) return;
-    window.__cxmsgs = [];
-    window.addEventListener("message", function (e) {
-      try {
-        var d = e.data;
-        var s = (typeof d === "string") ? d : JSON.stringify(d);
-        if (s == null) return;
-        if (s.length > 500) s = s.slice(0, 500);
-        window.__cxmsgs.push({ o: String(e.origin || "").slice(0, 70), d: s });
-        if (window.__cxmsgs.length > 80) window.__cxmsgs.shift();
-      } catch (x) {}
-    }, false);
-  } catch (x) {}
-}
-
-// DIAGNOSTIK (kun preview): injicér/erstat en test-<style> i preview-siden, så vi kan finjustere
-// annonce-feltets CSS mod den kørende motor UDEN at deploye igen. Kun CSS (ingen scripts). Live røres aldrig.
-async function applyTestCss(page, css) {
-  try {
-    await page.evaluate((c) => {
-      var s = document.getElementById("cx-test");
-      if (!s) { s = document.createElement("style"); s.id = "cx-test"; (document.head || document.documentElement).appendChild(s); }
-      s.textContent = c || "";
-    }, css);
-  } catch (e) {}
-}
-
-// DIAGNOSTIK (kun preview): dumper de synlige elementer i/omkring viewporten, så vi kan
-// se motorens FAKTISKE mobil-DOM (element-navne, størrelser, position) — uden at gætte.
-// Køres kun når klienten sender {t:"dumpdom"}. Ændrer intet på siden. Live røres aldrig.
-async function dumpPreviewDom(page) {
-  try {
-    return await page.evaluate(() => {
-      var out = [];
-      var vh = window.innerHeight, vw = window.innerWidth;
-      out.push("VIEWPORT " + vw + "x" + vh + " scrollY=" + Math.round(window.scrollY));
-      var all = document.querySelectorAll("*");
-      for (var i = 0; i < all.length && out.length < 500; i++) {
-        var el = all[i];
-        var r = el.getBoundingClientRect();
-        if (r.height < 18 || r.width < 30) continue;
-        if (r.bottom < -150 || r.top > vh + 150) continue;
-        var cs = getComputedStyle(el);
-        if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity) === 0) continue;
-        var tag = el.tagName.toLowerCase();
-        var id = el.id ? ("#" + el.id) : "";
-        var cls = (el.className && typeof el.className === "string")
-          ? ("." + el.className.trim().split(/\s+/).slice(0, 2).join(".")) : "";
-        var bg = (cs.backgroundImage && cs.backgroundImage !== "none") ? " BGIMG" : "";
-        out.push(tag + id + cls + " [" + Math.round(r.width) + "x" + Math.round(r.height) +
-                 " @top=" + Math.round(r.top) + "] " + cs.position + bg);
-      }
-      return out.join("\n");
-    });
-  } catch (e) { return "dump err: " + (e && e.message); }
-}
 
 function setupLive(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: "/live" });
@@ -1946,7 +1865,6 @@ function setupLive(httpServer) {
     liveCount++;
     METRICS.live.active++; METRICS.live.total++;
     let context = null, page = null, cdp = null, closed = false, started = false;
-    let previewSession = false;        // true when this is a "Preview only" session (enables dumpdom diag)
     let liveReady = false, navSeq = 0; // liveReady: initial load done → re-run consent+ads on later link-clicks
     let idleTimer = null;
     let manualConsent = false;
@@ -2023,7 +1941,6 @@ function setupLive(httpServer) {
         if (msg.t === "start") {
           if (started) return; started = true;
           const previewMode = !!msg.preview; // "Preview only" (Tilstand): Adnami page + strip chrome
-          previewSession = previewMode;
           const dev = DEVICES[msg.device] || DEVICES[DEFAULT_DEVICE];
           let vw = dev.w, vh = dev.h;
           if (dev.mobile && msg.landscape) { vw = dev.h; vh = dev.w; }
@@ -2065,7 +1982,6 @@ function setupLive(httpServer) {
           }
           // Preview only: strip Adnami's chrome from the first paint and keep it stripped.
           if (previewMode) { try { await context.addInitScript(previewStripInit); } catch {} }
-          if (previewMode) { try { await context.addInitScript(previewMsgSniffer); } catch {} }
           page = await context.newPage();
 
           // Fold "open in new tab" popups back into the main tab.
@@ -2150,24 +2066,6 @@ function setupLive(httpServer) {
           if (previewMode) await applyPreviewStrip(page);   // preview: show only the creative on a neutral page
           else await doInject();
           liveReady = true;   // initial page done → clicking to a new article now re-runs consent+ads
-        }
-        else if (msg.t === "dumpdom") {
-          // Diagnostik (kun preview): send motorens faktiske mobil-DOM tilbage. Ændrer intet.
-          if (previewSession && page) { const dom = await dumpPreviewDom(page); send({ t: "dbg", dom }); }
-          return;
-        }
-        else if (msg.t === "testcss") {
-          // Diagnostik (kun preview): live-finjuster annonce-feltets CSS uden ny deploy.
-          if (previewSession && page && typeof msg.css === "string") { await applyTestCss(page, msg.css); }
-          return;
-        }
-        else if (msg.t === "dumpmsgs") {
-          // Diagnostik (kun preview): send de opsnappede postMessages (annoncens størrelses-signal).
-          if (previewSession && page) {
-            let msgs = []; try { msgs = await page.evaluate(() => window.__cxmsgs || []); } catch {}
-            send({ t: "dbgmsgs", msgs });
-          }
-          return;
         }
         else if (!page) { return; }
         else {
