@@ -6,6 +6,14 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
+// 4.1-preview  Preview only: fikser VIDEO-fasen. Brugeren så bånd de første ~15-20 s (mens
+//              videoen spiller), hvorefter formatet faldt på plads i 673. Årsag (verificeret i
+//              motorens DOM): under video går interscroll'en i fuldskærms-takeover — Adnami sætter
+//              .adnm-html-interscroll-tag/-frame/-container/iframe til 890 via et stylesheet der
+//              loader EFTER vores, så deres regel vandt rækkefølgen; min 673 gjaldt først når det
+//              kollapsede til endcard. FIX: DOBBELT-selektorer (højere specificitet) + hold <style>
+//              sidst i <head>, så 673 vinder uanset rækkefølge — også under takeoveren. Verificeret
+//              live: takeover-tag'en bliver 673 med det samme. Kun preview; Live urørt.
 // 4.0-preview  Preview only: STABILITET. Samme 673-fix som 3.9, men retter en fejl JEG lavede
 //              i 3.9: CSS-injektionen kørte om ved HVER DOM-ændring (MutationObserver uden guard),
 //              hvilket under en video-annonce (tusindvis af mutationer) hamrede CPU/hukommelse og
@@ -130,7 +138,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "4.0-preview";                                          // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.1-preview";                                          // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1821,31 +1829,36 @@ function previewStripInit() {
   // height alene ignoreres — vi SKAL også nulstille top/bottom, ellers holder de 890 px. Med
   // top:0 + bottom:auto + height:673 fylder kreativet præcis 673 px, og artikel-indholdet flyder
   // rundt om. Kreativet re-renderer selv responsivt, når iframen skifter højde.
+  // Under selve VIDEOEN går interscroll'en i fuldskærms-takeover: Adnami sætter .adnm-html-
+  // interscroll-tag / -frame / -container / iframe til FULD viewport-højde (890) via et stylesheet
+  // der loader EFTER vores → deres regel vandt rækkefølgen, så min 673 gjaldt først når det
+  // kollapsede (endcard) efter ~15-20 s. FIX: (1) DOBBELT-selektorer → højere specificitet, så min
+  // regel slår Adnamis !important-regel uanset rækkefølge; (2) hold <style>'et SIDST i <head>, så
+  // den også vinder på rækkefølge. Verificeret live: så bliver takeover-tag'en 673 med det samme.
   var ADH = 673;
+  var box  = "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;min-height:0 !important;}";
+  var boxT = "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;min-height:0 !important;" +
+             "top:0 !important;bottom:auto !important;}";
   var SLOT =
-    "#adunit-incontent,.adnm-html-interscroll-frame-wrapper" +
-    "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;min-height:0 !important;}" +
-    ".adnm-html-interscroll-tag,.adnm-html-interscroll-frame,.adnm-html-interscroll-container," +
-    "iframe[id^='adsm-iframe']" +
-    "{height:" + ADH + "px !important;max-height:" + ADH + "px !important;" +
-    "top:0 !important;bottom:auto !important;}";
+    "#adunit-incontent#adunit-incontent" + box +
+    ".adnm-html-interscroll-frame-wrapper.adnm-html-interscroll-frame-wrapper" + box +
+    ".adnm-html-interscroll-tag.adnm-html-interscroll-tag" + boxT +
+    ".adnm-html-interscroll-frame.adnm-html-interscroll-frame" + boxT +
+    ".adnm-html-interscroll-container.adnm-html-interscroll-container" + boxT +
+    "iframe[id^='adsm-iframe'][id^='adsm-iframe']" + boxT;
   var CSS = HIDE + SLOT;
-  // EFFEKTIV injektion: <style>'et sættes ÉN gang. En stylesheet gælder globalt — også for
-  // elementer Adnami tilføjer bagefter — så vi behøver IKKE at gen-sætte den ved hver DOM-ændring.
-  // (3.9 gjorde netop det og hamrede CPU/hukommelse under video → forværrede motorens OOM.)
-  function inject() {
-    if (document.getElementById("cx-strip")) return;   // allerede sat → billig exit, ingen hamring
-    var s = document.createElement("style");
-    s.id = "cx-strip"; s.textContent = CSS;
-    (document.head || document.documentElement).appendChild(s);
+  // Placér <style>'et og HOLD det sidst i <head>, så det også vinder på cascade-rækkefølge, mens
+  // Adnami loader sine egne stylesheets under takeoveren. At flytte et element er billigt.
+  function place() {
+    var s = document.getElementById("cx-strip");
+    if (!s) { s = document.createElement("style"); s.id = "cx-strip"; }
+    if (s.textContent !== CSS) s.textContent = CSS;
+    var head = document.head || document.documentElement;
+    if (head && head.lastElementChild !== s) head.appendChild(s);   // keep it LAST
   }
-  inject();
-  document.addEventListener("DOMContentLoaded", inject);
-  var obs; try { obs = new MutationObserver(function () {
-    if (document.getElementById("cx-strip")) { try { obs.disconnect(); } catch (e) {} return; }
-    inject();
-  }); obs.observe(document.documentElement || document, { childList: true, subtree: true }); } catch (e) {}
-  var n = 0, iv = setInterval(function () { inject(); if (document.getElementById("cx-strip") || ++n > 25) clearInterval(iv); }, 400);
+  place();
+  document.addEventListener("DOMContentLoaded", place);
+  var n = 0, iv = setInterval(function () { place(); if (++n > 80) clearInterval(iv); }, 300); // ~24s (dækker video)
 }
 async function applyPreviewStrip(page) { try { await page.evaluate(previewStripInit); } catch {} }
 
