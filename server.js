@@ -6,15 +6,6 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
-// 5.2-consent-persist  Løser samtykke HELT: auto-accept + husk på tværs af artikelskift/refresh/
-//              session + fart tilbage. Bygget på 4.9. (1) giveConsent har FAST EXIT: er samtykke
-//              allerede gyldigt (seedet cookie eller tidligere accept), gør den INTET → artikelskift
-//              er øjeblikkeligt, ikke en ny handshake hver gang (det var det, der gjorde 5.0/5.1
-//              langsom). (2) Ved første accept gemmes samtykke-cookien MED DET SAMME (rememberConsent
-//              i giveConsent), så næste load seedes op-front af seedConsent → intet banner, ingen
-//              ventetid, annoncer fra første byte. (3) Ny /consent-selftest giver OBJEKTIV pass/fail
-//              (accept → reload samme kontekst → ny kontekst m. seed) uden at man skal mærke efter.
-//              Live-rendering urørt.
 // 4.9-clean    Preview only: OPRYDNING + performance. Beholder 4.8's rigtige fix (mobile-background
 //              fjernet fra skjuleren). Rullet SwiftShader tilbage til "--disable-gpu" (det var en
 //              blindgyde — problemet var skjuleren, ikke GPU; software-grafik gjorde bare afspilning
@@ -186,7 +177,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "5.3-consent-persist2";                                   // bump when deploying; visible at /health
+const ENGINE_VERSION  = "5.5-selftest-live49";                                   // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -617,7 +608,45 @@ const CONSENT_SELECTORS = [
   "button[mode='primary']",
 ];
 
-// Is a valid TCF consent string present right now? (Fast; returns instantly on non-TCF pages.)
+// Give proper GDPR/TCF consent so the page's ad auction actually serves ads.
+// valdemarsro uses Cookiebot (IAB TCF) — accept via its JS API AND the banner button.
+async function giveConsent(page) {
+  // 1) Wait for the CMP to actually initialise (it isn't ready at domcontentloaded).
+  await page.waitForFunction(
+    () => !!(window.Cookiebot || document.querySelector('#CybotCookiebotDialog, #onetrust-banner-sdk, [id*="didomi"], [id*="sp_message_container"]')),
+    { timeout: 10000 }
+  ).catch(() => {});
+  await page.waitForTimeout(400);
+  // 2) Accept ALL via Cookiebot's API (most reliable for the TCF string).
+  await page.evaluate(() => {
+    try {
+      if (window.Cookiebot) {
+        if (typeof window.Cookiebot.submitCustomConsent === "function") window.Cookiebot.submitCustomConsent(true, true, true);
+        else if (typeof window.Cookiebot.submit === "function") { try { window.Cookiebot.consent.preferences = true; window.Cookiebot.consent.statistics = true; window.Cookiebot.consent.marketing = true; } catch (e) {} window.Cookiebot.submit(window.Cookiebot.consent); }
+      }
+    } catch (e) {}
+  }).catch(() => {});
+  // 3) Also click the accept-all button (covers Cookiebot versions where the API differs).
+  await dismissConsent(page).catch(() => {});
+  // 4) WAIT for the TCF consent to actually be written (user-action-complete event).
+  await page.evaluate(() => new Promise((resolve) => {
+    try {
+      if (typeof window.__tcfapi !== "function") return resolve();
+      let done = false;
+      window.__tcfapi("addEventListener", 2, (d, ok) => {
+        if (ok && d && d.tcString && (d.eventStatus === "useractioncomplete" || d.eventStatus === "tcloaded")) { done = true; resolve(); }
+      });
+      setTimeout(() => { if (!done) resolve(); }, 7000);
+    } catch (e) { resolve(); }
+  })).catch(() => {});
+  await page.waitForTimeout(800);
+}
+
+// ---- EXPERIMENTAL auto-consent (used ONLY by /consent-selftest; live path still uses giveConsent
+// above until the self-test proves this green). Design: fresh accept per session, robust to a SLOW
+// CMP behind the proxy (generous wait), fast-exit once consent is valid so within-session article/
+// refresh is instant. No cross-session cookie replay (that replays a stale TCF and kills ad fill). ----
+const CX_ACCEPT_SELECTORS = "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, #CybotCookiebotDialogBodyButtonAcceptAll, #CybotCookiebotDialogBodyButtonAccept, #onetrust-accept-btn-handler, #didomi-notice-agree-button, .fc-cta-consent, #sp-cc-accept, [id*='sp_message_container'], button[aria-label='Accepter alle'], button[aria-label='Accept all']";
 async function isConsented(page) {
   return await page.evaluate(() => new Promise((resolve) => {
     try {
@@ -628,29 +657,16 @@ async function isConsented(page) {
     } catch (e) { resolve(false); }
   })).catch(() => false);
 }
-
-// Give proper GDPR/TCF consent so the page's ad auction actually serves ads — ONCE per host, then
-// remembered. Design goal: accept a single time, capture the consent cookie, and let seedConsent
-// replay it before every future load so refresh / article-switch / new session never re-prompt and
-// ads load from the first byte. Speed comes from the fast-exit: if consent is already valid (seeded
-// cookie or an earlier accept in this context), we do NOTHING — so navigating between articles is
-// instant, not a fresh handshake each time.
-async function giveConsent(page) {
-  // FAST EXIT — already consented (seeded/earlier). This is what keeps surfing snappy.
-  if (await isConsented(page)) return;
-
-  // Wait ONLY for an actual accept button to appear (short). No button in the window → nothing to
-  // accept, so we stop immediately instead of stalling (that stall was the earlier slowdown).
+async function giveConsentV2(page, opts = {}) {
+  const bannerTimeout = opts.bannerTimeout || 12000;
+  if (await isConsented(page)) return { skipped: "already-consented" };
+  const t0 = Date.now();
   const hasBanner = await page.waitForFunction(
-    () => !!document.querySelector(
-      "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, #CybotCookiebotDialogBodyButtonAcceptAll, #CybotCookiebotDialogBodyButtonAccept, #onetrust-accept-btn-handler, #didomi-notice-agree-button, .fc-cta-consent, #sp-cc-accept, [id*='sp_message_container'], button[aria-label='Accepter alle'], button[aria-label='Accept all']"),
-    { timeout: 3500 }
+    (sel) => !!document.querySelector(sel), CX_ACCEPT_SELECTORS, { timeout: bannerTimeout }
   ).then(() => true).catch(() => false);
-  if (!hasBanner) return;
-
-  // Accept: click the REAL "Allow all" (trusted click → full per-vendor TCF, like a manual accept)
-  // plus the Cookiebot API. Verify a valid TCF string landed; one quick retry for a late write.
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const msToButton = Date.now() - t0;
+  if (!hasBanner) return { hasBanner: false, msToButton };
+  for (let attempt = 0; attempt < 3; attempt++) {
     await dismissConsent(page).catch(() => {});
     await page.evaluate(() => {
       try {
@@ -660,16 +676,10 @@ async function giveConsent(page) {
         }
       } catch (e) {}
     }).catch(() => {});
-    await page.waitForTimeout(450);
-    if (await isConsented(page)) break;
+    await page.waitForTimeout(500);
+    if (await isConsented(page)) return { hasBanner: true, msToButton, msToConsent: Date.now() - t0, attempts: attempt + 1 };
   }
-
-  // Capture the freshly-written consent cookies so the very next load (refresh / next article /
-  // NEW session) is seeded up-front and never re-prompts. IMPORTANT: wait a beat first — Cookiebot
-  // writes its own cookie immediately but the IAB-TCF cookie (euconsent-v2, which the ad auction
-  // needs) lands a fraction of a second later. Capturing too early grabs only half the set, which
-  // is why a brand-new session used to re-prompt. (rememberConsent keeps ONLY consent cookies.)
-  try { await page.waitForTimeout(1000); await rememberConsent(page.context(), page.url()); } catch (e) {}
+  return { hasBanner: true, msToButton, consentFailed: true };
 }
 
 // Report whether a valid TCF consent string is now present (for diagnostics).
@@ -1669,13 +1679,18 @@ app.get("/adnm-slots", async (req, res) => {
   }
 });
 
-// SELF-TEST for consent persistence — objective pass/fail without eyeballing the live tool.
-// Proves the "accept once, remember forever" design end-to-end:
-//   step1: fresh context → load → giveConsent → is consent valid, was a consent cookie written?
-//   step2: RELOAD in the SAME context → does the banner stay gone (refresh/article-switch case)?
-//   step3: NEW context, seed the remembered cookie BEFORE load → banner gone + ads fill (new session)?
-// Read the JSON: pass1/pass2/pass3 = true means auto-accept works, survives refresh, and seeds
-// across sessions. bannerVisible2/3 must be false; consented* must be true.
+// SELF-TEST (safe: does NOT touch the live path) for the experimental giveConsentV2. Objective
+// pass/fail + timing + AD FILL, so we can prove auto-consent green before it ever ships to live.
+//   stepA: fresh context → load → giveConsentV2 → consent valid? how long did the CMP take?
+//   stepB: scroll → do ad slots actually FILL after a fresh auto-accept? (the thing that broke)
+//   stepC: reload SAME context → banner stays gone + still consented? (article-switch / refresh)
+const countAdSlots = (page) => page.evaluate(() => document.querySelectorAll('iframe[id^="adsm-iframe"], iframe[id*="google_ads"], iframe[src*="doubleclick"], iframe[id*="adsm"], iframe[id*="adnm"], ins.adsbygoogle iframe').length).catch(() => null);
+const bannerShown = (page) => page.evaluate(() => {
+  const el = document.querySelector("#CybotCookiebotDialog, #onetrust-banner-sdk, [id*='sp_message_container'], [id*='didomi-notice'], .fc-consent-root, [id*='CybotCookiebotDialog']");
+  if (!el) return false;
+  const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
+  return st.display !== "none" && st.visibility !== "hidden" && r.height > 2;
+}).catch(() => null);
 app.get("/consent-selftest", async (req, res) => {
   if (RENDER_TOKEN && req.query.token !== RENDER_TOKEN) return res.status(401).json({ error: "Ugyldig token" });
   const rawUrl = String(req.query.url || "").trim();
@@ -1685,61 +1700,41 @@ app.get("/consent-selftest", async (req, res) => {
   try { safeUrl = await assertSafeUrl(rawUrl); } catch (e) { return res.status(400).json({ error: e.message }); }
   registerFirstParty(safeUrl);
   const dev = DEVICES[device] || DEVICES[DEFAULT_DEVICE];
-  const ctxOpts = {
+  const context = await (await getBrowser()).newContext({
     viewport: { width: dev.w, height: dev.h }, deviceScaleFactor: 1,
     isMobile: dev.mobile, hasTouch: dev.mobile, userAgent: dev.ua,
     locale: LOCALE, timezoneId: TIMEZONE, ignoreHTTPSErrors: true,
-  };
-  const bannerVisible = (page) => page.evaluate(() => {
-    const el = document.querySelector("#CybotCookiebotDialog, #onetrust-banner-sdk, [id*='sp_message_container'], [id*='didomi-notice'], .fc-consent-root, [id*='CybotCookiebotDialog']");
-    if (!el) return false;
-    const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
-    return st.display !== "none" && st.visibility !== "hidden" && r.height > 2;
-  }).catch(() => null);
-  const listConsentCookies = async (context) => {
-    try { return (await context.cookies()).filter((c) => CONSENT_COOKIE_RE.test(c.name)).map((c) => ({ name: c.name, chars: (c.value || "").length, session: c.expires === -1 })); }
-    catch (e) { return []; }
-  };
-  const out = { version: ENGINE_VERSION, url: safeUrl };
-  let ctxA = null, ctxB = null;
+  });
+  const page = await context.newPage();
+  const out = { version: ENGINE_VERSION, url: safeUrl, note: "live path unchanged (4.9) — this tests giveConsentV2 only" };
   try {
-    // ---- STEP 1: fresh context, first accept ----
-    ctxA = await (await getBrowser()).newContext(ctxOpts);
-    const pA = await ctxA.newPage();
-    try { await pA.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 22000 }); } catch (e) { out.goto1 = String(e.message || e).split("\n")[0]; }
-    await giveConsent(pA);
-    out.consented1 = await isConsented(pA);
-    out.cookies1 = await listConsentCookies(ctxA);
-    out.ls1 = await pA.evaluate(() => { try { return Object.keys(localStorage).filter((k) => /consent|iabtcf|cookiebot|didomi|tcf|usercentrics/i.test(k)).slice(0, 20); } catch (e) { return []; } }).catch(() => []);
-    out.bannerVisible1 = await bannerVisible(pA);
-    // ---- STEP 2: reload the SAME context (refresh / article-switch case) ----
-    try { await pA.reload({ waitUntil: "domcontentloaded", timeout: 22000 }); } catch (e) { out.goto2 = String(e.message || e).split("\n")[0]; }
-    await pA.waitForTimeout(1500);
-    out.bannerVisible2 = await bannerVisible(pA);
-    out.consented2 = await isConsented(pA);
-    // ---- STEP 3: NEW context, seed remembered consent BEFORE load (new session) ----
-    ctxB = await (await getBrowser()).newContext(ctxOpts);
-    await seedConsent(ctxB, safeUrl);   // replay what step1 remembered
-    out.seededCount = (CONSENT_CACHE.get(hostKey(safeUrl)) || []).length;
-    const pB = await ctxB.newPage();
-    try { await pB.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 22000 }); } catch (e) { out.goto3 = String(e.message || e).split("\n")[0]; }
-    await pB.waitForTimeout(2000);
-    out.bannerVisible3 = await bannerVisible(pB);
-    out.consented3 = await isConsented(pB);
-    await pB.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 900); y += 900; if (y > 5000) { clearInterval(t); r(); } }, 160); setTimeout(() => { clearInterval(t); r(); }, 3000); })).catch(() => {});
-    await pB.waitForTimeout(800);
-    out.slotCount3 = await pB.evaluate(() => document.querySelectorAll('iframe[id^="adsm-iframe"], iframe[id*="google_ads"], iframe[src*="doubleclick"], iframe[id*="adsm"], iframe[id*="adnm"]').length).catch(() => null);
+    // ---- STEP A: fresh load + auto-accept (with timing) ----
+    const tNav = Date.now();
+    try { await page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 25000 }); } catch (e) { out.gotoNote = String(e.message || e).split("\n")[0]; }
+    out.msDomContentLoaded = Date.now() - tNav;
+    out.accept = await giveConsentV2(page);
+    out.consented = await isConsented(page);
+    out.bannerAfterAccept = await bannerShown(page);
+    out.consentCookies = await page.context().cookies().then((cs) => cs.filter((c) => CONSENT_COOKIE_RE.test(c.name)).map((c) => ({ name: c.name, chars: (c.value || "").length }))).catch(() => []);
+    // ---- STEP B: does the ad auction actually FILL after a fresh accept? ----
+    await page.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 800); y += 800; if (y > 6000) { clearInterval(t); r(); } }, 160); setTimeout(() => { clearInterval(t); r(); }, 3500); })).catch(() => {});
+    await page.waitForTimeout(2500);
+    out.adSlotsAfterAccept = await countAdSlots(page);
+    // ---- STEP C: reload same context (article-switch / refresh) ----
+    try { await page.reload({ waitUntil: "domcontentloaded", timeout: 25000 }); } catch (e) { out.reloadNote = String(e.message || e).split("\n")[0]; }
+    await page.waitForTimeout(2000);
+    out.bannerAfterReload = await bannerShown(page);
+    out.consentedAfterReload = await isConsented(page);
     // ---- verdicts ----
-    out.pass1_autoAccept = out.consented1 === true;
-    out.pass2_survivesRefresh = out.bannerVisible2 === false && out.consented2 === true;
-    out.pass3_survivesNewSession = out.bannerVisible3 === false && out.consented3 === true;
+    out.pass1_autoAccept = out.consented === true;
+    out.pass2_adsFill = typeof out.adSlotsAfterAccept === "number" && out.adSlotsAfterAccept > 0;
+    out.pass3_survivesRefresh = out.bannerAfterReload === false && out.consentedAfterReload === true;
     return res.json(out);
   } catch (e) {
     out.error = String(e.message || e);
     return res.status(502).json(out);
   } finally {
-    try { if (ctxA) await ctxA.close(); } catch {}
-    try { if (ctxB) await ctxB.close(); } catch {}
+    await context.close().catch(() => {});
   }
 });
 
