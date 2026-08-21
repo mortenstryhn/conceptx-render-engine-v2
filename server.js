@@ -6,22 +6,6 @@
 // NY 3.x-linje: startet fra den rene 2.80-backup. Numre genbruges ALDRIG;
 // gamle 2.81–2.87 er forladt og må ikke forveksles med disse.
 //
-// 5.1-consent-light  Retter 5.0's PERFORMANCE-regression + beholder Cookiebot-fixet. 5.0's løkke
-//              ventede op til 12s på "CMP klar", kørte 4 forsøg og ventede 5s mere — OGSÅ når
-//              samtykke allerede var givet, eller siden ingen CMP havde. På hver navigation stod
-//              den og masede ~20s i baggrunden og sloges med streamingen → hakkende scroll/animation
-//              og langsom CMP. Nu: (1) FAST EXIT hvis samtykke allerede findes (holder surfing
-//              hurtig), (2) vent kun kort på at accept-knappen faktisk dukker op — det var den ægte
-//              fix for videnskab.dk's kapløb — (3) accepter via rigtig "Tillad alle"-knap + API,
-//              kort verificér, max 1 gentagelse. Hård tidsgrænse, ingen baggrunds-churn. Live urørt.
-// 5.0-consent-verify  Cookiebot auto-accept fix. Bygget på 4.9-baseline. Symptom: på videnskab.dk
-//              (Cookiebot m. IAB TCF) gav auto-accept INGEN annoncer, mens MANUEL accept virkede.
-//              Årsag: gammel giveConsent fyrede accepten én gang efter en fast 400 ms-ventetid — på
-//              tunge sider bag proxyen var Cookiebot ikke klar endnu, så accepten no-op'ede og der
-//              blev aldrig skrevet en gyldig TCF-streng. Fix: klik den RIGTIGE "Tillad alle"-knap
-//              (som et menneske) + API-accept, og VERIFICÉR at TCF-strengen faktisk er skrevet —
-//              gentag op til 4 gange. giveConsent bruges også på live-stien, så auto-accept i live
-//              forbedres direkte. Live-rendering urørt.
 // 4.9-clean    Preview only: OPRYDNING + performance. Beholder 4.8's rigtige fix (mobile-background
 //              fjernet fra skjuleren). Rullet SwiftShader tilbage til "--disable-gpu" (det var en
 //              blindgyde — problemet var skjuleren, ikke GPU; software-grafik gjorde bare afspilning
@@ -193,7 +177,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "5.1-consent-light";                                     // bump when deploying; visible at /health
+const ENGINE_VERSION  = "4.9-clean";                                             // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -625,54 +609,37 @@ const CONSENT_SELECTORS = [
 ];
 
 // Give proper GDPR/TCF consent so the page's ad auction actually serves ads.
-// Cookiebot (IAB TCF) sites: we click the REAL "Allow all" button (exactly what a human does,
-// which grants full per-vendor TCF consent) AND fire the API — then VERIFY a valid TCF string
-// was actually written, retrying a few times. The old code fired once after a fixed 400 ms wait;
-// on heavier sites behind the proxy (e.g. videnskab.dk) Cookiebot wasn't ready yet, so the accept
-// no-op'd and ads never filled — while a manual click worked. Verify-and-retry fixes that race.
-async function isConsented(page) {
-  return await page.evaluate(() => new Promise((resolve) => {
-    try {
-      if (typeof window.__tcfapi !== "function") return resolve(false);
-      let settled = false;
-      window.__tcfapi("getTCData", 2, (d, ok) => { settled = true; resolve(!!(ok && d && d.tcString && d.tcString.length > 20)); });
-      setTimeout(() => { if (!settled) resolve(false); }, 2000);
-    } catch (e) { resolve(false); }
-  })).catch(() => false);
-}
+// valdemarsro uses Cookiebot (IAB TCF) — accept via its JS API AND the banner button.
 async function giveConsent(page) {
-  // FAST EXIT: if a valid TCF consent already exists (seeded cookie / earlier accept), do nothing.
-  // This is what keeps live surfing snappy — we only spend time when there's a fresh CMP to accept,
-  // never re-doing work on every navigation. (isConsented returns instantly on non-TCF pages too.)
-  if (await isConsented(page)) return;
-
-  // Detect an actionable accept control. Resolves the INSTANT a banner button appears; if none
-  // shows within a short window there's nothing to accept, so we stop — no long stall, no
-  // background churn competing with the live stream (that was the 5.0 regression).
-  const hasBanner = await page.waitForFunction(
-    () => !!document.querySelector(
-      "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, #CybotCookiebotDialogBodyButtonAcceptAll, #CybotCookiebotDialogBodyButtonAccept, #onetrust-accept-btn-handler, #didomi-notice-agree-button, .fc-cta-consent, #sp-cc-accept, [id*='sp_message_container'], button[aria-label='Accepter alle'], button[aria-label='Accept all']"),
-    { timeout: 3000 }
-  ).then(() => true).catch(() => false);
-  if (!hasBanner) return;
-
-  // Accept: click the REAL "Allow all" (trusted click → full per-vendor TCF, exactly like a manual
-  // accept) plus the Cookiebot API, then a short verify. One quick retry covers a late CMP write.
-  // Waiting for the button to actually exist (above) is the real fix for videnskab.dk's race —
-  // the old code fired after a fixed 400 ms, before the button was there, so the accept was lost.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    await dismissConsent(page).catch(() => {});
-    await page.evaluate(() => {
-      try {
-        if (window.Cookiebot) {
-          if (typeof window.Cookiebot.submitCustomConsent === "function") window.Cookiebot.submitCustomConsent(true, true, true);
-          else if (typeof window.Cookiebot.submit === "function") { try { window.Cookiebot.consent.preferences = true; window.Cookiebot.consent.statistics = true; window.Cookiebot.consent.marketing = true; } catch (e) {} window.Cookiebot.submit(window.Cookiebot.consent); }
-        }
-      } catch (e) {}
-    }).catch(() => {});
-    await page.waitForTimeout(450);
-    if (await isConsented(page)) return;
-  }
+  // 1) Wait for the CMP to actually initialise (it isn't ready at domcontentloaded).
+  await page.waitForFunction(
+    () => !!(window.Cookiebot || document.querySelector('#CybotCookiebotDialog, #onetrust-banner-sdk, [id*="didomi"], [id*="sp_message_container"]')),
+    { timeout: 10000 }
+  ).catch(() => {});
+  await page.waitForTimeout(400);
+  // 2) Accept ALL via Cookiebot's API (most reliable for the TCF string).
+  await page.evaluate(() => {
+    try {
+      if (window.Cookiebot) {
+        if (typeof window.Cookiebot.submitCustomConsent === "function") window.Cookiebot.submitCustomConsent(true, true, true);
+        else if (typeof window.Cookiebot.submit === "function") { try { window.Cookiebot.consent.preferences = true; window.Cookiebot.consent.statistics = true; window.Cookiebot.consent.marketing = true; } catch (e) {} window.Cookiebot.submit(window.Cookiebot.consent); }
+      }
+    } catch (e) {}
+  }).catch(() => {});
+  // 3) Also click the accept-all button (covers Cookiebot versions where the API differs).
+  await dismissConsent(page).catch(() => {});
+  // 4) WAIT for the TCF consent to actually be written (user-action-complete event).
+  await page.evaluate(() => new Promise((resolve) => {
+    try {
+      if (typeof window.__tcfapi !== "function") return resolve();
+      let done = false;
+      window.__tcfapi("addEventListener", 2, (d, ok) => {
+        if (ok && d && d.tcString && (d.eventStatus === "useractioncomplete" || d.eventStatus === "tcloaded")) { done = true; resolve(); }
+      });
+      setTimeout(() => { if (!done) resolve(); }, 7000);
+    } catch (e) { resolve(); }
+  })).catch(() => {});
+  await page.waitForTimeout(800);
 }
 
 // Report whether a valid TCF consent string is now present (for diagnostics).
