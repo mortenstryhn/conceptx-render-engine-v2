@@ -186,7 +186,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "5.2-consent-persist";                                   // bump when deploying; visible at /health
+const ENGINE_VERSION  = "5.3-consent-persist2";                                   // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -664,10 +664,12 @@ async function giveConsent(page) {
     if (await isConsented(page)) break;
   }
 
-  // Capture the freshly-written consent cookie(s) NOW, so the very next load (refresh / next article
-  // / device switch) is seeded up-front and never re-prompts. (rememberConsent keeps ONLY consent
-  // cookies, never ad-state.)
-  try { await rememberConsent(page.context(), page.url()); } catch (e) {}
+  // Capture the freshly-written consent cookies so the very next load (refresh / next article /
+  // NEW session) is seeded up-front and never re-prompts. IMPORTANT: wait a beat first — Cookiebot
+  // writes its own cookie immediately but the IAB-TCF cookie (euconsent-v2, which the ad auction
+  // needs) lands a fraction of a second later. Capturing too early grabs only half the set, which
+  // is why a brand-new session used to re-prompt. (rememberConsent keeps ONLY consent cookies.)
+  try { await page.waitForTimeout(1000); await rememberConsent(page.context(), page.url()); } catch (e) {}
 }
 
 // Report whether a valid TCF consent string is now present (for diagnostics).
@@ -1708,6 +1710,7 @@ app.get("/consent-selftest", async (req, res) => {
     await giveConsent(pA);
     out.consented1 = await isConsented(pA);
     out.cookies1 = await listConsentCookies(ctxA);
+    out.ls1 = await pA.evaluate(() => { try { return Object.keys(localStorage).filter((k) => /consent|iabtcf|cookiebot|didomi|tcf|usercentrics/i.test(k)).slice(0, 20); } catch (e) { return []; } }).catch(() => []);
     out.bannerVisible1 = await bannerVisible(pA);
     // ---- STEP 2: reload the SAME context (refresh / article-switch case) ----
     try { await pA.reload({ waitUntil: "domcontentloaded", timeout: 22000 }); } catch (e) { out.goto2 = String(e.message || e).split("\n")[0]; }
