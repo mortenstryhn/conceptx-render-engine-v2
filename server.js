@@ -177,7 +177,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "5.7-selftest-adscan2";                                   // bump when deploying; visible at /health
+const ENGINE_VERSION  = "5.8-auto-live";                                   // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -609,43 +609,19 @@ const CONSENT_SELECTORS = [
 ];
 
 // Give proper GDPR/TCF consent so the page's ad auction actually serves ads.
-// valdemarsro uses Cookiebot (IAB TCF) — accept via its JS API AND the banner button.
+// LIVE PATH now uses giveConsentV2 (below) — proven green via /consent-selftest on Cookiebot ad
+// pages: auto-accept lands a valid TCF string, real ad iframes fill (Adnami/GAM/Criteo/media.net),
+// and it survives refresh/article-switch. The fast-exit in V2 keeps within-session navigation
+// instant. (Old fixed-wait accept kept in git history if we ever need to compare.)
 async function giveConsent(page) {
-  // 1) Wait for the CMP to actually initialise (it isn't ready at domcontentloaded).
-  await page.waitForFunction(
-    () => !!(window.Cookiebot || document.querySelector('#CybotCookiebotDialog, #onetrust-banner-sdk, [id*="didomi"], [id*="sp_message_container"]')),
-    { timeout: 10000 }
-  ).catch(() => {});
-  await page.waitForTimeout(400);
-  // 2) Accept ALL via Cookiebot's API (most reliable for the TCF string).
-  await page.evaluate(() => {
-    try {
-      if (window.Cookiebot) {
-        if (typeof window.Cookiebot.submitCustomConsent === "function") window.Cookiebot.submitCustomConsent(true, true, true);
-        else if (typeof window.Cookiebot.submit === "function") { try { window.Cookiebot.consent.preferences = true; window.Cookiebot.consent.statistics = true; window.Cookiebot.consent.marketing = true; } catch (e) {} window.Cookiebot.submit(window.Cookiebot.consent); }
-      }
-    } catch (e) {}
-  }).catch(() => {});
-  // 3) Also click the accept-all button (covers Cookiebot versions where the API differs).
-  await dismissConsent(page).catch(() => {});
-  // 4) WAIT for the TCF consent to actually be written (user-action-complete event).
-  await page.evaluate(() => new Promise((resolve) => {
-    try {
-      if (typeof window.__tcfapi !== "function") return resolve();
-      let done = false;
-      window.__tcfapi("addEventListener", 2, (d, ok) => {
-        if (ok && d && d.tcString && (d.eventStatus === "useractioncomplete" || d.eventStatus === "tcloaded")) { done = true; resolve(); }
-      });
-      setTimeout(() => { if (!done) resolve(); }, 7000);
-    } catch (e) { resolve(); }
-  })).catch(() => {});
-  await page.waitForTimeout(800);
+  try { await giveConsentV2(page); } catch (e) {}
 }
 
-// ---- EXPERIMENTAL auto-consent (used ONLY by /consent-selftest; live path still uses giveConsent
-// above until the self-test proves this green). Design: fresh accept per session, robust to a SLOW
-// CMP behind the proxy (generous wait), fast-exit once consent is valid so within-session article/
-// refresh is instant. No cross-session cookie replay (that replays a stale TCF and kills ad fill). ----
+// ---- Auto-consent engine. PROVEN GREEN via /consent-selftest, then promoted: giveConsent() above
+// now delegates here, so the whole live path uses it. Design: fresh accept per session, robust to a
+// SLOW CMP behind the proxy (generous wait) + a CMP-presence guard so non-CMP pages don't stall,
+// fast-exit once consent is valid so within-session article/refresh is instant. No cross-session
+// cookie replay (that replays a stale TCF string and kills ad fill). ----
 const CX_ACCEPT_SELECTORS = "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, #CybotCookiebotDialogBodyButtonAcceptAll, #CybotCookiebotDialogBodyButtonAccept, #onetrust-accept-btn-handler, #didomi-notice-agree-button, .fc-cta-consent, #sp-cc-accept, [id*='sp_message_container'], button[aria-label='Accepter alle'], button[aria-label='Accept all']";
 async function isConsented(page) {
   return await page.evaluate(() => new Promise((resolve) => {
@@ -660,6 +636,14 @@ async function isConsented(page) {
 async function giveConsentV2(page, opts = {}) {
   const bannerTimeout = opts.bannerTimeout || 12000;
   if (await isConsented(page)) return { skipped: "already-consented" };
+  // Guard: is a CMP even present? Its script/object loads before the accept button fully renders.
+  // If none shows within a short window, there's nothing to accept — bail so pages WITHOUT a cookie
+  // box don't stall. (Old 4.9 giveConsent waited 10s unconditionally here; this is faster.)
+  const cmpPresent = await page.waitForFunction(
+    () => !!(window.__tcfapi || window.Cookiebot || document.querySelector("[id*='Cybot'], [id*='onetrust'], [id*='didomi'], [id*='sp_message'], [id*='usercentrics'], [class*='coi-'], [aria-label*='samtykke' i], [aria-label*='cookie' i]")),
+    { timeout: 6000 }
+  ).then(() => true).catch(() => false);
+  if (!cmpPresent) return { noCmp: true };
   const t0 = Date.now();
   const hasBanner = await page.waitForFunction(
     (sel) => !!document.querySelector(sel), CX_ACCEPT_SELECTORS, { timeout: bannerTimeout }
