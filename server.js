@@ -177,7 +177,7 @@ const LIVE_QUALITY_MIN= parseInt(process.env.LIVE_QUALITY_MIN || "58", 10);  // 
 const LIVE_MAX_W      = parseInt(process.env.LIVE_MAX_W || "1920", 10);      // cap streamed frame width — SHARPNESS lever (higher = sharper, heavier). ~1:1 with the tool's display at 1920.
 const LIVE_MAX_H      = parseInt(process.env.LIVE_MAX_H || "1200", 10);      // cap streamed frame height
 const LIVE_EVERYNTH_BIG = parseInt(process.env.LIVE_EVERYNTH_BIG || "1", 10);// frames to send on big viewports (1 = every frame). Metrics showed no backpressure, so default is now 1 for max fps; raise to 2 only if drops appear.
-const ENGINE_VERSION  = "5.6-selftest-adscan";                                   // bump when deploying; visible at /health
+const ENGINE_VERSION  = "5.7-selftest-adscan2";                                   // bump when deploying; visible at /health
 
 // Never let a single bad render (a thrown Playwright/proxy error in a stray async
 // callback) crash the whole service — that shows up in Render as "Exited with status 1"
@@ -1687,16 +1687,20 @@ app.get("/adnm-slots", async (req, res) => {
 const adInventory = (page) => page.evaluate(() => {
   const q = (s) => { try { return document.querySelectorAll(s).length; } catch (e) { return -1; } };
   const iframes = Array.from(document.querySelectorAll("iframe"));
-  const isAdish = (f) => /\b(ad|ads|adv|advert|doubleclick|google_ads|gpt|adnm|adsm|adnami|adform|criteo|banner|teads|outbrain|taboola|rubicon|pubmatic|amazon-adsystem|smartadserver)\b/i.test(((f.id || "") + " " + (f.src || "") + " " + (f.name || "")));
-  const adish = iframes.filter(isAdish);
+  // Plain substring patterns (NO \b word-boundaries — those fail on underscores like google_ads_iframe).
+  const pat = /(doubleclick|googlesyndication|google_ads|googleads|gampad|safeframe|2mdn|adnxs|adsystem|adservice|adnm|adsm|adnami|adform|criteo|teads|outbrain|taboola|rubicon|pubmatic|smartadserver|improvedigital|yieldlab|adtech|adroll)/i;
+  const info = iframes.map((f) => ({ id: (f.id || "").slice(0, 60), src: (f.src || "").slice(0, 90) }));
+  const adish = info.filter((f) => pat.test(f.id + " " + f.src));
   return {
     totalIframes: iframes.length,
     adishIframes: adish.length,
-    sampleAdish: adish.slice(0, 10).map((f) => ({ id: (f.id || "").slice(0, 44), src: (f.src || "").slice(0, 70) })),
-    gptSlots: q('div[id^="div-gpt-ad"], div[id*="gpt-ad"], div[id*="div-gpt"]'),
+    sampleAdish: adish.slice(0, 10),
+    allIframes: info.slice(0, 25),                                   // show EVERYTHING so we see what's really there
+    gptSlots: q('[id^="div-gpt-ad"], [id*="gpt-ad"], [id*="div-gpt"]'),
     adsbygoogle: q("ins.adsbygoogle"),
     adnamiEls: q('ins.adnm-tag, [class*="adnm"], [id*="adnm"]'),
     adsmIframes: q('iframe[id^="adsm-iframe"], iframe[id*="adsm"]'),
+    adDivs: q('[class*="advert"], [id*="ad-slot"], [class*="ad-slot"], [data-ad], [class*="dfp"], [id*="dfp"]'),
   };
 }).catch(() => null);
 const bannerShown = (page) => page.evaluate(() => {
@@ -1731,19 +1735,25 @@ app.get("/consent-selftest", async (req, res) => {
     out.bannerAfterAccept = await bannerShown(page);
     out.consentCookies = await page.context().cookies().then((cs) => cs.filter((c) => CONSENT_COOKIE_RE.test(c.name)).map((c) => ({ name: c.name, chars: (c.value || "").length }))).catch(() => []);
     // ---- STEP B: does the ad auction actually FILL after a fresh accept? ----
-    // Scroll the whole page (ads are usually lazy-loaded on view), then give the auction time.
-    await page.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 700); y += 700; if (y > 9000) { clearInterval(t); r(); } }, 150); setTimeout(() => { clearInterval(t); r(); }, 5000); })).catch(() => {});
-    await page.waitForTimeout(4000);   // programmatic auctions can take several seconds to render
-    out.adsAfterAccept = await adInventory(page);
+    // Scroll the whole page (ads are usually lazy-loaded on view), measure early AND late (slow
+    // programmatic auctions behind the proxy can take 10-20s to render).
+    const doScroll = () => page.evaluate(() => new Promise((r) => { let y = 0; const t = setInterval(() => { window.scrollBy(0, 700); y += 700; if (y > 9000) { clearInterval(t); r(); } }, 150); setTimeout(() => { clearInterval(t); r(); }, 4500); })).catch(() => {});
+    await doScroll();
+    await page.waitForTimeout(3000);
+    out.adsEarly = await adInventory(page);       // ~5s after consent
+    await page.waitForTimeout(10000);             // give the auction much more time
+    await doScroll();
+    await page.waitForTimeout(2000);
+    out.adsLate = await adInventory(page);        // ~17s after consent
     // ---- STEP C: reload same context (article-switch / refresh) ----
     try { await page.reload({ waitUntil: "domcontentloaded", timeout: 25000 }); } catch (e) { out.reloadNote = String(e.message || e).split("\n")[0]; }
     await page.waitForTimeout(2000);
     out.bannerAfterReload = await bannerShown(page);
     out.consentedAfterReload = await isConsented(page);
     // ---- verdicts ----
-    const ai = out.adsAfterAccept || {};
+    const ai = out.adsLate || {};
     out.pass1_autoAccept = out.consented === true;
-    out.pass2_adsFill = (ai.adishIframes > 0) || (ai.gptSlots > 0) || (ai.adsmIframes > 0) || (ai.adnamiEls > 0);
+    out.pass2_adsFill = (ai.adishIframes > 0) || (ai.gptSlots > 0) || (ai.adsmIframes > 0) || (ai.adnamiEls > 0) || (ai.adDivs > 0);
     out.pass3_survivesRefresh = out.bannerAfterReload === false && out.consentedAfterReload === true;
     return res.json(out);
   } catch (e) {
